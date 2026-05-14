@@ -2,11 +2,25 @@ import pandas as pd
 import pytest
 
 from src.defect_analysis import (
+    generate_quality_summary,
     get_top_dimension_item,
     prepare_pareto_data,
     summarize_by_defect_type,
     summarize_by_dimension,
 )
+
+
+def build_summary_test_data():
+    return pd.DataFrame(
+        {
+            "零件名称": ["支架", "支架", "外壳"],
+            "工序": ["铣削", "铣削", "检验"],
+            "缺陷类型": ["划伤", "划伤", "变形"],
+            "缺陷数量": [4, 2, 1],
+            "供应商": ["A供应商", "A供应商", "B供应商"],
+            "严重等级": ["高", "高", "中"],
+        }
+    )
 
 
 def test_summarize_by_defect_type_groups_counts_and_ratios():
@@ -178,3 +192,60 @@ def test_get_top_dimension_item_returns_none_for_empty_data():
     top_item = get_top_dimension_item(df)
 
     assert top_item is None
+
+
+def test_generate_quality_summary_returns_list_for_normal_data():
+    df = build_summary_test_data()
+
+    summary = generate_quality_summary(df)
+
+    assert isinstance(summary, list)
+    assert all(isinstance(item, str) for item in summary)
+    assert len(summary) > 0
+
+
+def test_generate_quality_summary_includes_record_and_defect_counts():
+    df = build_summary_test_data()
+
+    summary_text = "\n".join(generate_quality_summary(df))
+
+    assert "共 3 条记录" in summary_text
+    assert "总缺陷数量为 7" in summary_text
+
+
+def test_generate_quality_summary_includes_top_defect_type():
+    df = build_summary_test_data()
+
+    summary_text = "\n".join(generate_quality_summary(df))
+
+    assert "主要缺陷类型：划伤" in summary_text
+    assert "为 6" in summary_text
+
+
+def test_generate_quality_summary_warns_when_high_severity_ratio_over_threshold():
+    df = build_summary_test_data()
+
+    summary_text = "\n".join(generate_quality_summary(df))
+
+    assert "高严重等级缺陷占比为 85.71%" in summary_text
+    assert "占比较高，建议优先复核相关零件、工序和供应商" in summary_text
+
+
+def test_generate_quality_summary_handles_empty_data():
+    df = pd.DataFrame(
+        columns=["缺陷类型", "缺陷数量", "零件名称", "工序", "供应商", "严重等级"]
+    )
+
+    summary = generate_quality_summary(df)
+
+    assert summary == ["当前数据为空，无法生成质量分析摘要。"]
+
+
+def test_generate_quality_summary_handles_missing_required_columns():
+    df = pd.DataFrame({"缺陷类型": ["划伤"], "缺陷数量": [1]})
+
+    summary = generate_quality_summary(df)
+
+    assert len(summary) == 1
+    assert "缺少必要字段" in summary[0]
+    assert "无法生成质量分析摘要" in summary[0]

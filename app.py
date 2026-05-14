@@ -2,6 +2,7 @@ import streamlit as st
 
 from src.charts import create_pareto_chart
 from src.defect_analysis import (
+    generate_quality_summary,
     get_top_dimension_item,
     prepare_pareto_data,
     summarize_by_defect_type,
@@ -98,6 +99,14 @@ else:
                 show_dimension_analysis(df, "供应商", "供应商")
             with severity_tab:
                 show_dimension_analysis(df, "严重等级", "严重等级")
+
+            st.subheader("质量分析摘要")
+            try:
+                quality_summary = generate_quality_summary(df)
+                for item in quality_summary:
+                    st.markdown(f"- {item}")
+            except Exception as exc:
+                st.error(f"质量分析摘要生成失败：{exc}")
 
         st.subheader("当前文件字段列表")
         st.write(list(df.columns))
