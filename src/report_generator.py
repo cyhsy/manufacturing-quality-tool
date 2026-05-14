@@ -9,6 +9,7 @@ from src.defect_analysis import (
     SUPPLIER_COLUMN,
     generate_quality_summary,
     prepare_pareto_data,
+    summarize_by_date,
     summarize_by_dimension,
 )
 
@@ -29,6 +30,13 @@ def _build_defect_type_summary(df):
         return prepare_pareto_data(df)
     except ValueError:
         return _message_df("缺少字段：缺陷类型或缺陷数量，无法生成缺陷类型统计。")
+
+
+def _build_date_summary(df):
+    try:
+        return summarize_by_date(df)
+    except ValueError:
+        return _message_df("缺少字段：日期或缺陷数量，无法生成日期趋势统计。")
 
 
 def build_excel_report(df):
@@ -68,6 +76,11 @@ def build_excel_report(df):
         _build_dimension_summary(df, SEVERITY_COLUMN).to_excel(
             writer,
             sheet_name="严重等级统计",
+            index=False,
+        )
+        _build_date_summary(df).to_excel(
+            writer,
+            sheet_name="日期趋势统计",
             index=False,
         )
 

@@ -3,6 +3,7 @@ import pandas as pd
 
 DEFECT_TYPE_COLUMN = "缺陷类型"
 DEFECT_COUNT_COLUMN = "缺陷数量"
+DATE_COLUMN = "日期"
 RATIO_COLUMN = "占比"
 CUMULATIVE_RATIO_COLUMN = "累计占比"
 RECORD_COUNT_COLUMN = "记录数"
@@ -67,6 +68,71 @@ def get_top_dimension_item(summary_df):
         return None
 
     return summary_df.iloc[0]
+
+
+def summarize_by_date(df):
+    """Summarize defect counts and record counts by date."""
+    required_columns = [DATE_COLUMN, DEFECT_COUNT_COLUMN]
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError("缺少必要字段：" + "、".join(missing_columns))
+
+    result_columns = [DATE_COLUMN, DEFECT_COUNT_COLUMN, RECORD_COUNT_COLUMN]
+    if df.empty:
+        return pd.DataFrame(columns=result_columns)
+
+    data = df[[DATE_COLUMN, DEFECT_COUNT_COLUMN]].copy()
+    data[DATE_COLUMN] = pd.to_datetime(data[DATE_COLUMN], errors="coerce").dt.date
+    data[DEFECT_COUNT_COLUMN] = pd.to_numeric(
+        data[DEFECT_COUNT_COLUMN],
+        errors="coerce",
+    ).fillna(0)
+    data = data.dropna(subset=[DATE_COLUMN])
+
+    if data.empty:
+        return pd.DataFrame(columns=result_columns)
+
+    summary = (
+        data.groupby(DATE_COLUMN, as_index=False)
+        .agg(
+            **{
+                DEFECT_COUNT_COLUMN: (DEFECT_COUNT_COLUMN, "sum"),
+                RECORD_COUNT_COLUMN: (DEFECT_COUNT_COLUMN, "size"),
+            }
+        )
+        .sort_values(DATE_COLUMN, ascending=True)
+        .reset_index(drop=True)
+    )
+
+    return summary[result_columns]
+
+
+def get_top_defect_date(date_summary_df):
+    """Return the date row with the highest defect count from a date summary."""
+    if date_summary_df.empty:
+        return None
+
+    return date_summary_df.sort_values(
+        DEFECT_COUNT_COLUMN,
+        ascending=False,
+    ).iloc[0]
+
+
+def filter_records_by_date(df, target_date):
+    """Filter original records by one target date."""
+    if DATE_COLUMN not in df.columns:
+        raise ValueError("缺少必要字段：" + DATE_COLUMN)
+
+    if df.empty:
+        return df.copy()
+
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return df.iloc[0:0].copy()
+
+    data = df.copy()
+    record_dates = pd.to_datetime(data[DATE_COLUMN], errors="coerce").dt.date
+    return data.loc[record_dates == target.date()].copy()
 
 
 def summarize_by_defect_type(df):

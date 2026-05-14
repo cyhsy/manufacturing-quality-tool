@@ -1,10 +1,16 @@
+import pandas as pd
 import streamlit as st
 
-from src.charts import create_pareto_chart
+from src.charts import create_date_trend_chart, create_pareto_chart
 from src.defect_analysis import (
+    DATE_COLUMN,
+    DEFECT_COUNT_COLUMN,
+    filter_records_by_date,
     generate_quality_summary,
+    get_top_defect_date,
     get_top_dimension_item,
     prepare_pareto_data,
+    summarize_by_date,
     summarize_by_defect_type,
     summarize_by_dimension,
 )
@@ -29,6 +35,68 @@ def show_dimension_analysis(df, dimension_col, item_label):
         )
 
     st.dataframe(summary.head(10), width="stretch")
+
+
+def show_date_trend_and_trace(df):
+    st.subheader("日期趋势与批次追溯")
+    try:
+        date_summary = summarize_by_date(df)
+        if date_summary.empty:
+            st.info("暂无可用于生成日期趋势与批次追溯的数据。")
+            return
+
+        date_trend_chart = create_date_trend_chart(date_summary)
+        st.plotly_chart(date_trend_chart, width="stretch")
+
+        top_defect_date = get_top_defect_date(date_summary)
+        if top_defect_date is not None:
+            st.write(
+                f"缺陷数量最高的日期：{top_defect_date[DATE_COLUMN]}，"
+                f"缺陷数量：{top_defect_date[DEFECT_COUNT_COLUMN]}"
+            )
+
+        available_dates = list(date_summary[DATE_COLUMN])
+        selected_date = st.date_input(
+            "选择日期查看当天异常记录",
+            value=top_defect_date[DATE_COLUMN],
+            min_value=min(available_dates),
+            max_value=max(available_dates),
+        )
+
+        selected_records = filter_records_by_date(df, selected_date)
+        trace_columns = [
+            "日期",
+            "批次号",
+            "零件编号",
+            "零件名称",
+            "工序",
+            "缺陷类型",
+            "缺陷数量",
+            "批次数量",
+            "供应商",
+            "责任部门",
+            "严重等级",
+            "处理状态",
+        ]
+        display_columns = [
+            column for column in trace_columns if column in selected_records.columns
+        ]
+
+        if selected_records.empty:
+            st.info("所选日期没有对应异常记录。")
+        elif display_columns:
+            records_to_show = selected_records[display_columns].copy()
+            records_to_show[DATE_COLUMN] = pd.to_datetime(
+                records_to_show[DATE_COLUMN],
+                errors="coerce",
+            ).dt.date
+            st.dataframe(records_to_show, width="stretch")
+        else:
+            st.dataframe(selected_records, width="stretch")
+    except ValueError as exc:
+        st.warning(str(exc))
+    except Exception as exc:
+        st.error(f"日期趋势与批次追溯生成失败：{exc}")
 
 
 st.set_page_config(
@@ -108,6 +176,8 @@ else:
                     st.markdown(f"- {item}")
             except Exception as exc:
                 st.error(f"质量分析摘要生成失败：{exc}")
+
+        show_date_trend_and_trace(df)
 
         st.subheader("导出分析报告")
         try:

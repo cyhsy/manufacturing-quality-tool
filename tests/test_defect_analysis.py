@@ -2,9 +2,12 @@ import pandas as pd
 import pytest
 
 from src.defect_analysis import (
+    filter_records_by_date,
     generate_quality_summary,
+    get_top_defect_date,
     get_top_dimension_item,
     prepare_pareto_data,
+    summarize_by_date,
     summarize_by_defect_type,
     summarize_by_dimension,
 )
@@ -192,6 +195,98 @@ def test_get_top_dimension_item_returns_none_for_empty_data():
     top_item = get_top_dimension_item(df)
 
     assert top_item is None
+
+
+def test_summarize_by_date_groups_defect_counts():
+    df = pd.DataFrame(
+        {
+            "日期": ["2026-05-14", "2026-05-14", "2026-05-15"],
+            "缺陷数量": [2, 3, 4],
+        }
+    )
+
+    summary = summarize_by_date(df)
+
+    assert summary.loc[0, "日期"] == pd.Timestamp("2026-05-14").date()
+    assert summary.loc[0, "缺陷数量"] == 5
+    assert summary.loc[0, "记录数"] == 2
+    assert summary.loc[1, "缺陷数量"] == 4
+
+
+def test_summarize_by_date_sorts_by_date_ascending():
+    df = pd.DataFrame(
+        {
+            "日期": ["2026-05-16", "2026-05-14", "2026-05-15"],
+            "缺陷数量": [1, 5, 3],
+        }
+    )
+
+    summary = summarize_by_date(df)
+
+    assert list(summary["日期"]) == [
+        pd.Timestamp("2026-05-14").date(),
+        pd.Timestamp("2026-05-15").date(),
+        pd.Timestamp("2026-05-16").date(),
+    ]
+
+
+def test_get_top_defect_date_returns_highest_defect_count_date():
+    date_summary = pd.DataFrame(
+        {
+            "日期": [
+                pd.Timestamp("2026-05-14").date(),
+                pd.Timestamp("2026-05-15").date(),
+            ],
+            "缺陷数量": [5, 8],
+            "记录数": [2, 3],
+        }
+    )
+
+    top_date = get_top_defect_date(date_summary)
+
+    assert top_date["日期"] == pd.Timestamp("2026-05-15").date()
+    assert top_date["缺陷数量"] == 8
+
+
+def test_filter_records_by_date_returns_records_for_target_date():
+    df = pd.DataFrame(
+        {
+            "日期": ["2026-05-14", pd.Timestamp("2026-05-14 10:00:00"), "2026-05-15"],
+            "批次号": ["B001", "B002", "B003"],
+            "缺陷数量": [2, 3, 4],
+        }
+    )
+
+    records = filter_records_by_date(df, "2026-05-14")
+
+    assert list(records["批次号"]) == ["B001", "B002"]
+
+
+def test_date_analysis_handles_empty_data():
+    df = pd.DataFrame(columns=["日期", "缺陷数量"])
+
+    summary = summarize_by_date(df)
+    top_date = get_top_defect_date(summary)
+    records = filter_records_by_date(df, "2026-05-14")
+
+    assert summary.empty
+    assert list(summary.columns) == ["日期", "缺陷数量", "记录数"]
+    assert top_date is None
+    assert records.empty
+
+
+def test_summarize_by_date_raises_clear_error_when_date_column_missing():
+    df = pd.DataFrame({"缺陷数量": [1]})
+
+    with pytest.raises(ValueError, match="缺少必要字段：日期"):
+        summarize_by_date(df)
+
+
+def test_filter_records_by_date_raises_clear_error_when_date_column_missing():
+    df = pd.DataFrame({"缺陷数量": [1]})
+
+    with pytest.raises(ValueError, match="缺少必要字段：日期"):
+        filter_records_by_date(df, "2026-05-14")
 
 
 def test_generate_quality_summary_returns_list_for_normal_data():

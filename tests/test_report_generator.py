@@ -12,6 +12,7 @@ EXPECTED_SHEETS = [
     "工序统计",
     "供应商统计",
     "严重等级统计",
+    "日期趋势统计",
     "质量分析摘要",
 ]
 
@@ -19,6 +20,7 @@ EXPECTED_SHEETS = [
 def build_report_test_data():
     return pd.DataFrame(
         {
+            "日期": ["2026-05-14", "2026-05-14", "2026-05-15"],
             "零件名称": ["支架", "支架", "外壳"],
             "工序": ["铣削", "铣削", "检验"],
             "缺陷类型": ["划伤", "划伤", "变形"],
@@ -51,6 +53,16 @@ def test_build_excel_report_contains_expected_sheets():
 
     for sheet_name in EXPECTED_SHEETS:
         assert sheet_name in excel_file.sheet_names
+
+
+def test_build_excel_report_contains_date_trend_summary_sheet():
+    report_bytes = build_excel_report(build_report_test_data())
+
+    excel_file = pd.ExcelFile(BytesIO(report_bytes))
+    date_summary = pd.read_excel(excel_file, sheet_name="日期趋势统计")
+
+    assert "日期趋势统计" in excel_file.sheet_names
+    assert list(date_summary["缺陷数量"]) == [6, 1]
 
 
 def test_build_excel_report_handles_empty_data():

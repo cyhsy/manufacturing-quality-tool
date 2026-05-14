@@ -2,6 +2,7 @@ import plotly.graph_objects as go
 
 from src.defect_analysis import (
     CUMULATIVE_RATIO_COLUMN,
+    DATE_COLUMN,
     DEFECT_COUNT_COLUMN,
     DEFECT_TYPE_COLUMN,
 )
@@ -47,6 +48,31 @@ def create_pareto_chart(pareto_df):
             range=[0, 1],
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+
+def create_date_trend_chart(date_summary_df):
+    """Create a date trend chart with defect counts."""
+    required_columns = [DATE_COLUMN, DEFECT_COUNT_COLUMN]
+    missing_columns = [column for column in required_columns if column not in date_summary_df.columns]
+    if missing_columns:
+        raise ValueError("日期趋势数据缺少必要字段：" + "、".join(missing_columns))
+
+    fig = go.Figure()
+    if not date_summary_df.empty:
+        fig.add_scatter(
+            x=date_summary_df[DATE_COLUMN],
+            y=date_summary_df[DEFECT_COUNT_COLUMN],
+            name="缺陷数量",
+            mode="lines+markers",
+        )
+
+    fig.update_layout(
+        title="按日期缺陷趋势图",
+        xaxis_title="日期",
+        yaxis_title="缺陷数量",
     )
 
     return fig
