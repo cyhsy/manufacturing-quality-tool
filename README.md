@@ -76,6 +76,15 @@ pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
+也可以在 Windows 下双击 `run_app.bat` 启动项目。该脚本会自动切换到项目目录，并在存在 `.venv` 时激活本地虚拟环境。
+
+## 展示方式
+
+- 在线演示链接：待部署后补充
+- 本地运行：可使用 `run_app.bat`，也可以使用命令行运行 `python -m streamlit run app.py`
+- 推荐先查看 README 和关键功能截图，再进行现场演示
+- 当前项目使用 `sample_data/defect_records_sample.xlsx` 示例数据演示
+
 ## 测试
 
 ```cmd
