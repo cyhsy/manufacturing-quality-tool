@@ -1,8 +1,32 @@
 import streamlit as st
 
 from src.charts import create_pareto_chart
-from src.defect_analysis import prepare_pareto_data, summarize_by_defect_type
+from src.defect_analysis import (
+    get_top_dimension_item,
+    prepare_pareto_data,
+    summarize_by_defect_type,
+    summarize_by_dimension,
+)
 from src.data_loader import load_quality_file, validate_required_columns
+
+
+def show_dimension_analysis(df, dimension_col, item_label):
+    try:
+        summary = summarize_by_dimension(df, dimension_col)
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+
+    top_item = get_top_dimension_item(summary)
+    if top_item is None:
+        st.warning(f"暂无可用于按{dimension_col}统计的数据。")
+    else:
+        st.write(
+            f"缺陷最多的{item_label}：{top_item[dimension_col]}，"
+            f"缺陷数量：{top_item['缺陷数量']}"
+        )
+
+    st.dataframe(summary.head(10), width="stretch")
 
 
 st.set_page_config(
@@ -61,6 +85,19 @@ else:
                 st.warning(str(exc))
             except Exception as exc:
                 st.error(f"Pareto 图生成失败：{exc}")
+
+            st.subheader("多维度问题定位")
+            part_tab, process_tab, supplier_tab, severity_tab = st.tabs(
+                ["零件", "工序", "供应商", "严重等级"]
+            )
+            with part_tab:
+                show_dimension_analysis(df, "零件名称", "零件")
+            with process_tab:
+                show_dimension_analysis(df, "工序", "工序")
+            with supplier_tab:
+                show_dimension_analysis(df, "供应商", "供应商")
+            with severity_tab:
+                show_dimension_analysis(df, "严重等级", "严重等级")
 
         st.subheader("当前文件字段列表")
         st.write(list(df.columns))
