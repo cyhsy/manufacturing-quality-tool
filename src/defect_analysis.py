@@ -1,0 +1,37 @@
+import pandas as pd
+
+
+DEFECT_TYPE_COLUMN = "缺陷类型"
+DEFECT_COUNT_COLUMN = "缺陷数量"
+
+
+def summarize_by_defect_type(df):
+    """Summarize defect counts and ratios by defect type."""
+    required_columns = [DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN]
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError("缺少必要字段：" + "、".join(missing_columns))
+
+    if df.empty:
+        return pd.DataFrame(columns=[DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN, "占比"])
+
+    data = df[[DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN]].copy()
+    data[DEFECT_COUNT_COLUMN] = pd.to_numeric(
+        data[DEFECT_COUNT_COLUMN],
+        errors="coerce",
+    ).fillna(0)
+
+    summary = (
+        data.groupby(DEFECT_TYPE_COLUMN, as_index=False)[DEFECT_COUNT_COLUMN]
+        .sum()
+        .sort_values(DEFECT_COUNT_COLUMN, ascending=False)
+        .reset_index(drop=True)
+    )
+
+    total_defect_count = summary[DEFECT_COUNT_COLUMN].sum()
+    if total_defect_count == 0:
+        summary["占比"] = 0
+    else:
+        summary["占比"] = summary[DEFECT_COUNT_COLUMN] / total_defect_count
+
+    return summary

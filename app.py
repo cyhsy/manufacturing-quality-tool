@@ -1,5 +1,6 @@
 import streamlit as st
 
+from src.defect_analysis import summarize_by_defect_type
 from src.data_loader import load_quality_file, validate_required_columns
 
 
@@ -37,6 +38,15 @@ else:
             st.warning("缺少必要字段：" + "、".join(missing_columns))
         else:
             st.success("必要字段检查通过。")
+
+            defect_summary = summarize_by_defect_type(df)
+            total_defect_count = defect_summary["缺陷数量"].sum()
+            defect_type_count = len(defect_summary)
+
+            st.subheader("缺陷类型统计")
+            st.write(f"总缺陷数量：{total_defect_count}")
+            st.write(f"缺陷类型数量：{defect_type_count}")
+            st.dataframe(defect_summary, width="stretch")
 
         st.subheader("当前文件字段列表")
         st.write(list(df.columns))
