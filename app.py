@@ -9,6 +9,7 @@ from src.defect_analysis import (
     summarize_by_dimension,
 )
 from src.data_loader import load_quality_file, validate_required_columns
+from src.report_generator import build_excel_report
 
 
 def show_dimension_analysis(df, dimension_col, item_label):
@@ -107,6 +108,18 @@ else:
                     st.markdown(f"- {item}")
             except Exception as exc:
                 st.error(f"质量分析摘要生成失败：{exc}")
+
+        st.subheader("导出分析报告")
+        try:
+            report_bytes = build_excel_report(df)
+            st.download_button(
+                label="下载 Excel 分析报告",
+                data=report_bytes,
+                file_name="quality_analysis_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as exc:
+            st.error(f"Excel 分析报告生成失败：{exc}")
 
         st.subheader("当前文件字段列表")
         st.write(list(df.columns))
