@@ -3,6 +3,8 @@ import pandas as pd
 
 DEFECT_TYPE_COLUMN = "缺陷类型"
 DEFECT_COUNT_COLUMN = "缺陷数量"
+RATIO_COLUMN = "占比"
+CUMULATIVE_RATIO_COLUMN = "累计占比"
 
 
 def summarize_by_defect_type(df):
@@ -13,7 +15,7 @@ def summarize_by_defect_type(df):
         raise ValueError("缺少必要字段：" + "、".join(missing_columns))
 
     if df.empty:
-        return pd.DataFrame(columns=[DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN, "占比"])
+        return pd.DataFrame(columns=[DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN, RATIO_COLUMN])
 
     data = df[[DEFECT_TYPE_COLUMN, DEFECT_COUNT_COLUMN]].copy()
     data[DEFECT_COUNT_COLUMN] = pd.to_numeric(
@@ -30,8 +32,31 @@ def summarize_by_defect_type(df):
 
     total_defect_count = summary[DEFECT_COUNT_COLUMN].sum()
     if total_defect_count == 0:
-        summary["占比"] = 0
+        summary[RATIO_COLUMN] = 0
     else:
-        summary["占比"] = summary[DEFECT_COUNT_COLUMN] / total_defect_count
+        summary[RATIO_COLUMN] = summary[DEFECT_COUNT_COLUMN] / total_defect_count
+
+    return summary
+
+
+def prepare_pareto_data(df):
+    """Prepare defect type counts, ratios, and cumulative ratios for a Pareto chart."""
+    summary = summarize_by_defect_type(df)
+
+    if summary.empty:
+        return pd.DataFrame(
+            columns=[
+                DEFECT_TYPE_COLUMN,
+                DEFECT_COUNT_COLUMN,
+                RATIO_COLUMN,
+                CUMULATIVE_RATIO_COLUMN,
+            ]
+        )
+
+    total_defect_count = summary[DEFECT_COUNT_COLUMN].sum()
+    if total_defect_count == 0:
+        summary[CUMULATIVE_RATIO_COLUMN] = 0
+    else:
+        summary[CUMULATIVE_RATIO_COLUMN] = summary[RATIO_COLUMN].cumsum()
 
     return summary

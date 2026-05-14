@@ -1,6 +1,7 @@
 import streamlit as st
 
-from src.defect_analysis import summarize_by_defect_type
+from src.charts import create_pareto_chart
+from src.defect_analysis import prepare_pareto_data, summarize_by_defect_type
 from src.data_loader import load_quality_file, validate_required_columns
 
 
@@ -47,6 +48,19 @@ else:
             st.write(f"总缺陷数量：{total_defect_count}")
             st.write(f"缺陷类型数量：{defect_type_count}")
             st.dataframe(defect_summary, width="stretch")
+
+            st.subheader("缺陷类型 Pareto 图")
+            try:
+                pareto_df = prepare_pareto_data(df)
+                if pareto_df.empty:
+                    st.warning("暂无可用于生成 Pareto 图的数据。")
+                else:
+                    pareto_chart = create_pareto_chart(pareto_df)
+                    st.plotly_chart(pareto_chart, width="stretch")
+            except ValueError as exc:
+                st.warning(str(exc))
+            except Exception as exc:
+                st.error(f"Pareto 图生成失败：{exc}")
 
         st.subheader("当前文件字段列表")
         st.write(list(df.columns))

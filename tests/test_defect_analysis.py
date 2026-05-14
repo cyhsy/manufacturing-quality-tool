@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.defect_analysis import summarize_by_defect_type
+from src.defect_analysis import prepare_pareto_data, summarize_by_defect_type
 
 
 def test_summarize_by_defect_type_groups_counts_and_ratios():
@@ -50,3 +50,40 @@ def test_summarize_by_defect_type_handles_empty_data():
 
     assert summary.empty
     assert list(summary.columns) == ["缺陷类型", "缺陷数量", "占比"]
+
+
+def test_prepare_pareto_data_includes_cumulative_ratio():
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["划伤", "变形", "划伤", "少件"],
+            "缺陷数量": [2, 3, 4, 1],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert "累计占比" in pareto_df.columns
+    assert pareto_df.loc[len(pareto_df) - 1, "累计占比"] == pytest.approx(1)
+
+
+def test_prepare_pareto_data_sorts_by_count_descending():
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["少件", "划伤", "变形"],
+            "缺陷数量": [1, 5, 3],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert list(pareto_df["缺陷类型"]) == ["划伤", "变形", "少件"]
+    assert list(pareto_df["缺陷数量"]) == [5, 3, 1]
+
+
+def test_prepare_pareto_data_handles_empty_data():
+    df = pd.DataFrame(columns=["缺陷类型", "缺陷数量"])
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert pareto_df.empty
+    assert list(pareto_df.columns) == ["缺陷类型", "缺陷数量", "占比", "累计占比"]
