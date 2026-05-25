@@ -85,21 +85,82 @@ def test_prepare_pareto_data_includes_cumulative_ratio():
     pareto_df = prepare_pareto_data(df)
 
     assert "累计占比" in pareto_df.columns
-    assert pareto_df.loc[len(pareto_df) - 1, "累计占比"] == pytest.approx(1)
+    assert pareto_df.loc[len(pareto_df) - 1, "累计占比"] == pytest.approx(1.0)
+
+
+def test_prepare_pareto_data_merges_small_counts_into_other():
+    """Types with count <= 5 should be merged into '其他' as the last row."""
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["划伤", "变形", "少件"],
+            "缺陷数量": [10, 3, 1],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert list(pareto_df["缺陷类型"]) == ["划伤", "其他"]
+    assert list(pareto_df["缺陷数量"]) == [10, 4]
+    assert pareto_df["占比"].iloc[-1] == pytest.approx(4 / 14)
+    assert pareto_df["累计占比"].iloc[-1] == pytest.approx(1.0)
+
+
+def test_prepare_pareto_data_no_other_when_all_above_threshold():
+    """When all types have count > 5, no '其他' row is added."""
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["划伤", "变形"],
+            "缺陷数量": [10, 8],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert "其他" not in pareto_df["缺陷类型"].values
+    assert list(pareto_df["缺陷类型"]) == ["划伤", "变形"]
+
+
+def test_prepare_pareto_data_all_small_becomes_other_only():
+    """When all types have count <= 5, only one '其他' row exists."""
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["划伤", "少件"],
+            "缺陷数量": [3, 2],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+
+    assert list(pareto_df["缺陷类型"]) == ["其他"]
+    assert list(pareto_df["缺陷数量"]) == [5]
+    assert pareto_df["累计占比"].iloc[-1] == pytest.approx(1.0)
+
+
+def test_prepare_pareto_data_validates_last_row_100_percent():
+    """The last row cumulative ratio must be exactly 100%."""
+    df = pd.DataFrame(
+        {
+            "缺陷类型": ["A", "B"],
+            "缺陷数量": [6, 3],
+        }
+    )
+
+    pareto_df = prepare_pareto_data(df)
+    assert pareto_df["累计占比"].iloc[-1] == pytest.approx(1.0)
 
 
 def test_prepare_pareto_data_sorts_by_count_descending():
     df = pd.DataFrame(
         {
             "缺陷类型": ["少件", "划伤", "变形"],
-            "缺陷数量": [1, 5, 3],
+            "缺陷数量": [1, 8, 3],
         }
     )
 
     pareto_df = prepare_pareto_data(df)
 
-    assert list(pareto_df["缺陷类型"]) == ["划伤", "变形", "少件"]
-    assert list(pareto_df["缺陷数量"]) == [5, 3, 1]
+    assert list(pareto_df["缺陷类型"]) == ["划伤", "其他"]
+    assert list(pareto_df["缺陷数量"]) == [8, 4]
 
 
 def test_prepare_pareto_data_handles_empty_data():

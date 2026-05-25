@@ -168,7 +168,15 @@ def summarize_by_defect_type(df):
 
 
 def prepare_pareto_data(df):
-    """Prepare defect type counts, ratios, and cumulative ratios for a Pareto chart."""
+    """Prepare defect type counts, ratios, and cumulative ratios for a Pareto chart.
+
+    Rules:
+    - Sorted by defect count descending (mandatory for Pareto).
+    - Defect types with count <= 5 are merged into "其他" and placed last.
+    - Ratio = count / total.
+    - Cumulative ratio = cumulative count / total (NOT cumulative sum of ratios).
+    - Last row ("其他") cumulative ratio must equal exactly 100%.
+    """
     summary = summarize_by_defect_type(df)
 
     if summary.empty:
@@ -181,13 +189,42 @@ def prepare_pareto_data(df):
             ]
         )
 
-    total_defect_count = summary[DEFECT_COUNT_COLUMN].sum()
-    if total_defect_count == 0:
-        summary[CUMULATIVE_RATIO_COLUMN] = 0
-    else:
-        summary[CUMULATIVE_RATIO_COLUMN] = summary[RATIO_COLUMN].cumsum()
+    total = summary[DEFECT_COUNT_COLUMN].sum()
+    if total == 0:
+        summary[RATIO_COLUMN] = 0.0
+        summary[CUMULATIVE_RATIO_COLUMN] = 0.0
+        return summary
 
-    return summary
+    major = summary[summary[DEFECT_COUNT_COLUMN] > 5].copy()
+    minor = summary[summary[DEFECT_COUNT_COLUMN] <= 5]
+
+    if not minor.empty:
+        other_count = int(minor[DEFECT_COUNT_COLUMN].sum())
+        other_row = pd.DataFrame(
+            [{DEFECT_TYPE_COLUMN: "其他", DEFECT_COUNT_COLUMN: other_count}]
+        )
+        if not major.empty:
+            result = pd.concat([major, other_row], ignore_index=True)
+        else:
+            result = other_row
+        # Re-sort: 其他 may have higher count than some items in major
+        result = result.sort_values(
+            DEFECT_COUNT_COLUMN, ascending=False
+        ).reset_index(drop=True)
+    else:
+        result = major.copy()
+
+    result[RATIO_COLUMN] = result[DEFECT_COUNT_COLUMN] / total
+    result[CUMULATIVE_RATIO_COLUMN] = result[DEFECT_COUNT_COLUMN].cumsum() / total
+
+    last_cum = result[CUMULATIVE_RATIO_COLUMN].iloc[-1]
+    if abs(last_cum - 1.0) > 0.001:
+        raise ValueError(
+            f"数据校验失败：累计占比最后一行应为 100%，"
+            f"实际为 {last_cum:.4%}。请检查原始数据统计是否正确。"
+        )
+
+    return result
 
 
 def generate_quality_summary(df):

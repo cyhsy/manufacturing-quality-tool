@@ -5,3 +5,5 @@ plotly
 matplotlib
 pytest
 ruff
+python-docx
+kaleido
