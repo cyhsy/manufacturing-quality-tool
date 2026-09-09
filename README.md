@@ -17,7 +17,8 @@
 
 ## 已实现功能
 
-- 上传 Excel/CSV 质量异常记录
+- 打开页面自动载入内置示例数据，无需演示者准备文件
+- 可切换为上传 Excel/CSV 质量异常记录
 - 字段完整性检查
 - 原始数据预览
 - 缺陷类型统计
@@ -25,13 +26,15 @@
 - 多维度问题定位
 - 质量分析摘要
 - 日期趋势与批次追溯
-- 导出 Excel 分析报告
+- 导出 Excel 分析报告和 Word 8D 分析报告
+- 可选 DeepSeek 聚合质量分析（未配置 Key 时不影响传统功能）
 
 ## 使用流程
 
 1. 启动 Streamlit 应用
-2. 上传 `sample_data/defect_records_sample.xlsx` 或自己的质量异常记录
-3. 查看数据预览和字段检查
+2. 页面默认载入 `sample_data/质量异常记录样本.xlsx`
+3. 直接查看分析结果，或切换为上传自己的质量异常记录
+4. 查看数据预览和字段检查
 4. 查看缺陷类型统计和 Pareto 图
 5. 查看多维度问题定位
 6. 查看质量分析摘要
@@ -83,7 +86,7 @@ python -m streamlit run app.py
 - 在线演示链接：待部署后补充
 - 本地运行：可使用 `run_app.bat`，也可以使用命令行运行 `python -m streamlit run app.py`
 - 推荐先查看 README 和关键功能截图，再进行现场演示
-- 当前项目使用 `sample_data/defect_records_sample.xlsx` 示例数据演示
+- 当前项目打开页面后会自动使用 `sample_data/质量异常记录样本.xlsx` 演示
 
 ## 测试
 
@@ -93,7 +96,7 @@ python -m pytest
 
 ## 项目边界
 
-- 不接大模型 API
+- DeepSeek 为可选增强功能，仅发送聚合统计；未配置 API Key 时传统功能仍可使用
 - 不做自动图纸识别
 - 不做完整 QMS/MES/PLM 系统
 - 不替代质量工程师判断

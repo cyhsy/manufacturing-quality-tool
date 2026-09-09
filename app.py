@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -9,6 +12,8 @@ from src.charts import (
     create_pareto_chart,
     create_root_cause_pareto_chart,
 )
+from src.data_loader import load_quality_file, validate_required_columns
+from src.demo_data import list_sample_files, load_sample_upload
 from src.defect_analysis import (
     DATE_COLUMN,
     DEFECT_COUNT_COLUMN,
@@ -21,7 +26,10 @@ from src.defect_analysis import (
     summarize_by_defect_type,
     summarize_by_dimension,
 )
-from src.data_loader import load_quality_file, validate_required_columns
+from src.llm_quality_analysis import (
+    DeepSeekAnalysisError,
+    generate_deepseek_quality_analysis,
+)
 from src.report_generator import build_excel_report
 from src.root_cause_engine import (
     find_defect_root_causes,
@@ -400,6 +408,70 @@ def show_bidirectional_pareto(df):
         )
 
 
+def show_deepseek_quality_analysis(df, dataset_signature):
+    """Generate and display a cached DeepSeek quality analysis on demand."""
+    st.markdown("### DeepSeek AI 结构化分析")
+    st.caption(
+        "AI 仅分析聚合统计数据，不接收原始批次明细，也不判断具体缺陷根因。"
+    )
+
+    if st.session_state.get("deepseek_dataset_signature") != dataset_signature:
+        st.session_state["deepseek_dataset_signature"] = dataset_signature
+        st.session_state.pop("deepseek_quality_analysis", None)
+        st.session_state.pop("deepseek_api_usage", None)
+        st.session_state.pop("deepseek_quality_error", None)
+
+    if st.button("生成 AI 质量分析", type="primary", key="generate_deepseek_analysis"):
+        with st.spinner("正在调用 DeepSeek 分析统计结果……"):
+            try:
+                result = generate_deepseek_quality_analysis(df)
+            except DeepSeekAnalysisError as exc:
+                st.session_state.pop("deepseek_quality_analysis", None)
+                st.session_state.pop("deepseek_api_usage", None)
+                st.session_state["deepseek_quality_error"] = str(exc)
+            else:
+                st.session_state["deepseek_quality_analysis"] = (
+                    result.analysis.model_dump()
+                )
+                st.session_state["deepseek_api_usage"] = result.usage.model_dump()
+                st.session_state.pop("deepseek_quality_error", None)
+
+    error_message = st.session_state.get("deepseek_quality_error")
+    if error_message:
+        st.warning(f"{error_message} 原有统计、传统摘要和报告导出仍可正常使用。")
+
+    result = st.session_state.get("deepseek_quality_analysis")
+    if not result:
+        return
+
+    st.markdown(f"**分析摘要：** {result['summary']}")
+    st.markdown(f"**数据关注等级：{result['risk_level']}**")
+    st.caption(
+        "该等级仅表示当前统计数据的关注程度，不代表质量放行、正式工程风险或失效判定。"
+    )
+
+    st.markdown("**关键发现**")
+    for item in result["key_findings"]:
+        st.markdown(f"- {item}")
+
+    st.markdown("**建议复核项**")
+    for index, item in enumerate(result["recommended_checks"], start=1):
+        st.markdown(f"{index}. {item}")
+
+    usage = st.session_state.get("deepseek_api_usage", {})
+    with st.expander("API 用量", expanded=False):
+        st.caption("仅用于开发验收；不显示 API Key 或完整 Prompt。")
+
+        def format_tokens(field_name):
+            value = usage.get(field_name)
+            return str(value) if value is not None else "未返回"
+
+        st.write(f"输入 Tokens：{format_tokens('prompt_tokens')}")
+        st.write(f"输出 Tokens：{format_tokens('completion_tokens')}")
+        st.write(f"推理 Tokens：{format_tokens('reasoning_tokens')}")
+        st.write(f"总 Tokens：{format_tokens('total_tokens')}")
+
+
 st.set_page_config(
     page_title="Manufacturing Quality Tool",
     layout="wide",
@@ -407,13 +479,40 @@ st.set_page_config(
 
 st.title("制造质量数据分析与检验计划辅助工具")
 
-uploaded_file = st.file_uploader(
-    "上传质量异常记录文件",
-    type=["csv", "xlsx", "xls"],
+st.caption("打开页面即可使用内置示例数据完整演示；也可以切换为上传自己的文件。")
+
+data_source = st.radio(
+    "数据来源",
+    ["内置示例数据", "上传自己的文件"],
+    horizontal=True,
 )
 
+if data_source == "内置示例数据":
+    sample_dir = Path(__file__).resolve().parent / "sample_data"
+    try:
+        sample_files = list_sample_files(sample_dir)
+        selected_sample_name = st.selectbox(
+            "选择演示数据",
+            [path.name for path in sample_files],
+            help="默认样例覆盖零件、工序、供应商、严重等级、日期趋势和报告导出。",
+        )
+        selected_sample_path = next(
+            path for path in sample_files if path.name == selected_sample_name
+        )
+        uploaded_file = load_sample_upload(selected_sample_path)
+        st.info(f"当前使用演示数据：{selected_sample_name}")
+    except (FileNotFoundError, OSError) as exc:
+        uploaded_file = None
+        st.error(f"示例数据加载失败：{exc}")
+else:
+    uploaded_file = st.file_uploader(
+        "上传质量异常记录文件",
+        type=["csv", "xlsx", "xls"],
+    )
+
 if uploaded_file is None:
-    st.info("请上传 csv、xlsx 或 xls 文件。")
+    if data_source == "上传自己的文件":
+        st.info("请上传 csv、xlsx 或 xls 文件。")
 else:
     try:
         df = load_quality_file(uploaded_file)
@@ -470,6 +569,9 @@ else:
                     st.markdown(f"- {item}")
             except Exception as exc:
                 st.error(f"质量分析摘要生成失败：{exc}")
+
+            dataset_signature = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+            show_deepseek_quality_analysis(df, dataset_signature)
 
         show_date_trend_and_trace(df)
 

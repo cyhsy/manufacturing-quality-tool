@@ -7,3 +7,5 @@ pytest
 ruff
 python-docx
 kaleido
+openai
+pydantic
