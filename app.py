@@ -13,7 +13,6 @@ from src.charts import (
     create_root_cause_pareto_chart,
 )
 from src.data_loader import load_quality_file, validate_required_columns
-from src.demo_data import list_sample_files, load_sample_upload
 from src.defect_analysis import (
     DATE_COLUMN,
     DEFECT_COUNT_COLUMN,
@@ -26,6 +25,7 @@ from src.defect_analysis import (
     summarize_by_defect_type,
     summarize_by_dimension,
 )
+from src.demo_data import list_sample_files, load_sample_upload
 from src.llm_quality_analysis import (
     DeepSeekAnalysisError,
     generate_deepseek_quality_analysis,
@@ -301,9 +301,7 @@ def show_bidirectional_pareto(df):
                 and d in root_cause_to_defects.get(
                     st.session_state["bidir_root_cause"], []
                 )
-            ):
-                highlight_indices.add(i)
-            elif (
+            ) or (
                 st.session_state["bidir_defect"]
                 and d == st.session_state["bidir_defect"]
             ):

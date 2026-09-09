@@ -1,7 +1,6 @@
 from io import BytesIO
 from pathlib import Path
 
-
 SUPPORTED_DATA_SUFFIXES = {".csv", ".xlsx", ".xls"}
 DEFAULT_SAMPLE_NAME = "质量异常记录样本.xlsx"
 
