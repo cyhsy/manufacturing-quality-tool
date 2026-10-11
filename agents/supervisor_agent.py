@@ -32,7 +32,7 @@ import json
 import os
 import re
 
-from agent_tools import order_tools
+from agent_tools import equipment_tools, order_tools
 from agents import equipment_agent, order_agent, quality_agent
 
 
@@ -71,9 +71,22 @@ CAPABILITIES = {
         "tool_module": "agent_tools.quality_tools",
         "description": "缺陷统计、严重等级与根因（复用原有质量分析）",
     },
+    "equipment_failure": {
+        "label": "设备故障",
+        "agent": "equipment_agent",
+        "tool_module": "agent_tools.equipment_tools",
+        "description": "单台设备故障诊断（台账 + 传感器 + 故障知识库 + 维修工单）",
+    },
 }
 
+# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备动作能力）
 CAPABILITY_ORDER = ["order", "inventory", "production", "equipment", "quality"]
+
+# 设备级动作能力（S3-A-04）：只在用户指向具体设备时启用
+ACTION_CAPABILITIES = ["equipment_failure"]
+
+# 全部能力（排序与筛选用）
+ALL_CAPABILITY_ORDER = CAPABILITY_ORDER + ACTION_CAPABILITIES
 
 # 交付类问题必须同时具备的能力（订单信息 + 物料齐套性 + 瓶颈产能）
 DELIVERY_CAPABILITIES = ("order", "inventory", "production")
@@ -81,6 +94,7 @@ DELIVERY_CAPABILITIES = ("order", "inventory", "production")
 INTENT_LABELS = {
     "comprehensive_risk": "工厂综合风险分析",
     "order_delivery": "订单交付能力分析",
+    "equipment_failure": "设备故障诊断",
     "equipment_query": "设备状态查询",
     "quality_query": "质量分析",
     "inventory_query": "库存查询",
@@ -105,6 +119,14 @@ INTENT_RULES = (
         "reason": "交付能力取决于订单信息、物料齐套性与瓶颈产能",
     },
     {
+        # 单台设备故障诊断：必须同时命中「故障类关键词」与「具体设备编号」
+        "code": "equipment_failure",
+        "keywords": ("报警", "告警", "故障", "停机", "异常", "诊断", "维修", "坏", "异响", "过热"),
+        "capabilities": ("equipment_failure",),
+        "requires_entity": "equipment_id",
+        "reason": "用户指向具体设备的故障现象，按单台设备故障诊断 + 维修工单处理",
+    },
+    {
         "code": "overview",
         "keywords": ("什么情况", "整体情况", "概况", "总览", "overview"),
         "capabilities": tuple(CAPABILITY_ORDER),
@@ -124,6 +146,8 @@ INTENT_KEYWORDS = {
 # 订单编号形如 O001；用 [A-Za-z]\d{2,} 而不是 \bO\d+\b，
 # 因为中文属于 \w，"订单O001" 中 O 前面没有词边界。
 ORDER_ID_PATTERN = re.compile(r"[A-Za-z]\d{2,}")
+# 设备编号形如 CNC02 / WELD02 / CAST01，需与真实设备台账比对后采用
+EQUIPMENT_ID_PATTERN = re.compile(r"[A-Z]{2,}\d{2,}")
 QUANTITY_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(?:件|个|台|套|只|pcs|PCS)")
 DAYS_PATTERN = re.compile(r"(\d+)\s*(?:天|日)")
 WEEKS_PATTERN = re.compile(r"(\d+)\s*(?:周|星期)")
@@ -148,6 +172,7 @@ SECTION_TITLES = {
     "inventory": "物料库存风险",
     "production": "产能风险",
     "equipment": "设备风险",
+    "equipment_failure": "设备故障风险",
     "quality": "质量风险",
 }
 
@@ -173,18 +198,45 @@ def _known_products():
         return []
 
 
+def _known_equipment_ids():
+    """读取真实设备编号用于匹配；数据不可用时返回空列表。"""
+    try:
+        return [
+            str(record["equipment_id"])
+            for record in equipment_tools.get_equipment_records()
+        ]
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+
+
 def extract_order_ids(text, known_order_ids=None):
     """从文本中提取订单编号。
 
-    提供 ``known_order_ids`` 时只保留真实存在的编号，避免把无关的字母数字串当订单号。
+    提供 ``known_order_ids`` 且其中确有可比对的编号时，只返回真实存在的订单号；
+    否则设备编号（如 CNC02）会被 ``[A-Za-z]\\d{2,}`` 误判为订单编号。
     """
     candidates = {match.group(0).upper() for match in ORDER_ID_PATTERN.finditer(str(text))}
     if known_order_ids is None:
         return sorted(candidates)
 
     known = {str(value).upper() for value in known_order_ids}
-    matched = candidates & known
-    return sorted(matched) if matched else sorted(candidates)
+    if known:
+        return sorted(candidates & known)
+
+    return sorted(candidates)
+
+
+def extract_equipment_ids(text, known_equipment_ids=None):
+    """从文本中提取设备编号（如 CNC02），只保留台账中真实存在的设备。"""
+    candidates = {match.group(0).upper() for match in EQUIPMENT_ID_PATTERN.finditer(str(text))}
+    if known_equipment_ids is None:
+        return sorted(candidates)
+
+    known = {str(value).upper() for value in known_equipment_ids}
+    if known:
+        return sorted(candidates & known)
+
+    return sorted(candidates)
 
 
 def _first_number(pattern, text):
@@ -205,10 +257,11 @@ def extract_product(text, known_products=None):
 
 
 def extract_entities(text, today=None):
-    """抽取请求实体：订单编号、产品、数量、交期天数或具体日期。"""
+    """抽取请求实体：订单编号、设备编号、产品、数量、交期天数或具体日期。"""
     content = str(text or "")
 
     order_ids = extract_order_ids(content, _known_order_ids())
+    equipment_ids = extract_equipment_ids(content, _known_equipment_ids())
     product = extract_product(content)
     quantity = _first_number(QUANTITY_PATTERN, content)
 
@@ -224,6 +277,8 @@ def extract_entities(text, today=None):
     entities = {
         "order_ids": order_ids,
         "order_id": order_ids[0] if order_ids else None,
+        "equipment_ids": equipment_ids,
+        "equipment_id": equipment_ids[0] if equipment_ids else None,
         "product": product,
         "quantity": quantity,
         "delivery_days": None if delivery_days is None else int(delivery_days),
@@ -263,8 +318,12 @@ def classify(text, entities):
     lowered = str(text).lower()
 
     for rule in INTENT_RULES:
-        if any(keyword.lower() in lowered for keyword in rule["keywords"]):
-            return rule["code"], _label_for(rule["code"]), list(rule["capabilities"]), rule["reason"]
+        if not any(keyword.lower() in lowered for keyword in rule["keywords"]):
+            continue
+        required_entity = rule.get("requires_entity")
+        if required_entity and not entities.get(required_entity):
+            continue
+        return rule["code"], _label_for(rule["code"]), list(rule["capabilities"]), rule["reason"]
 
     # 无风险/交付关键词，但给出了订单号或「产品 + 数量」：按交付能力分析处理
     if entities.get("order_ids") or (
@@ -275,6 +334,15 @@ def classify(text, entities):
             _label_for("order_delivery"),
             list(DELIVERY_CAPABILITIES),
             "用户给出了具体订单实体，按交付能力分析处理",
+        )
+
+    # 只给出设备编号：按单台设备故障诊断处理
+    if entities.get("equipment_ids"):
+        return (
+            "equipment_failure",
+            _label_for("equipment_failure"),
+            ["equipment_failure"],
+            f"用户指向具体设备 {entities['equipment_ids'][0]}，按设备故障诊断处理",
         )
 
     matched = detect_capabilities(text)
@@ -304,6 +372,8 @@ def _action_for(capability, entities):
         if entities.get("product") and entities.get("quantity"):
             return "analyze_order_request"
         return "analyze_orders_overview"
+    if capability == "equipment_failure":
+        return "diagnose_equipment_failure"
     return {
         "inventory": "get_inventory_summary",
         "production": "get_factory_capacity",
@@ -322,6 +392,14 @@ def _reason_for(capability, entities):
                 "需要按该产品与数量测算交付能力"
             )
         return "用户需要订单整体情况，需要订单基础信息"
+
+    if capability == "equipment_failure":
+        if entities.get("equipment_id"):
+            return (
+                f"用户报告设备 {entities['equipment_id']} 报警/异常，"
+                "需要台账状态 + 传感器读数 + 故障知识库诊断，并生成维修工单"
+            )
+        return "用户关注单台设备故障，需要设备故障诊断"
 
     return {
         "inventory": "交付能力取决于物料齐套性，需要库存与安全库存状态",
@@ -358,6 +436,8 @@ def build_steps(capabilities, entities):
                 step_arguments["delivery_days"] = entities["delivery_days"]
             if step_arguments:
                 step["arguments"] = step_arguments
+        elif capability == "equipment_failure" and entities.get("equipment_id"):
+            step["arguments"] = {"equipment_id": entities["equipment_id"]}
 
         steps.append(step)
 
@@ -367,7 +447,17 @@ def build_steps(capabilities, entities):
 def _dispatch_arguments(entities):
     """传给子 Agent 的上下文（去掉 None，保留 today 便于测试固定日期）。"""
     arguments = {}
-    for key in ("order_ids", "order_id", "product", "quantity", "delivery_days", "deadline", "today"):
+    for key in (
+        "order_ids",
+        "order_id",
+        "equipment_ids",
+        "equipment_id",
+        "product",
+        "quantity",
+        "delivery_days",
+        "deadline",
+        "today",
+    ):
         value = entities.get(key)
         if value is not None:
             arguments[key] = value
@@ -418,7 +508,9 @@ def build_plan(user_input, use_llm=None, llm_client_factory=None):
         return plan
 
     llm_capabilities = [
-        capability for capability in CAPABILITY_ORDER if capability in set(llm_result["capabilities"])
+        capability
+        for capability in ALL_CAPABILITY_ORDER
+        if capability in set(llm_result["capabilities"])
     ]
 
     # 规则与 LLM 取并集：LLM 只能增补，不能削减规则判定的必要能力
@@ -430,7 +522,7 @@ def build_plan(user_input, use_llm=None, llm_client_factory=None):
             merged.update(DELIVERY_CAPABILITIES)
 
     final_capabilities = [
-        capability for capability in CAPABILITY_ORDER if capability in merged
+        capability for capability in ALL_CAPABILITY_ORDER if capability in merged
     ]
     final_entities = dict(entities)
     if llm_order_ids:
@@ -466,15 +558,22 @@ def explain_plan(plan):
         f"规划方式：{plan['planner']}",
     ]
 
-    entities = {
-        key: value
-        for key, value in plan["entities"].items()
-        if value and key != "order_ids"
+    entity_labels = {
+        "order_id": "订单编号",
+        "equipment_id": "设备编号",
+        "product": "产品",
+        "quantity": "数量",
+        "delivery_days": "交期天数",
+        "deadline": "交付日期",
     }
-    if entities:
-        lines.append(
-            "识别实体：" + "、".join(f"{key}={value}" for key, value in entities.items())
-        )
+    entity_parts = []
+    for key, label in entity_labels.items():
+        value = plan["entities"].get(key)
+        if value in (None, "", []):
+            continue
+        entity_parts.append(f"{label}={value}")
+    if entity_parts:
+        lines.append("识别实体：" + "、".join(entity_parts))
 
     lines.append("执行计划：")
     for step in plan["steps"]:

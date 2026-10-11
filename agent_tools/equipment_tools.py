@@ -1,9 +1,13 @@
 """设备域 Agent 取数封装。
 
-调用链：``agents/equipment_agent.py`` -> ``agent_tools/equipment_tools.py``
--> ``tools/equipment_tool.py``（设备台账）与 ``tools.read_data_csv()``（传感器数据）-> ``data/*.csv``
+调用链：
 
-设备状态判定与维保口径复用 ``modules/equipment_analysis.py``。
+    agents/equipment_agent.py
+        -> agent_tools/equipment_tools.py
+            -> tools/equipment_tool.py       设备台账（data/equipment.csv）
+            -> tools/iot_sensor_tool.py      传感器数据（data/iot_sensor.csv）
+            -> modules/equipment_analysis.py 状态判定与维保口径
+            -> modules/equipment_knowledge.py 故障案例库检索（knowledge/equipment/）
 """
 
 import pandas as pd
@@ -16,20 +20,10 @@ from modules.equipment_analysis import (
     get_status_breakdown,
     summarize_equipment,
 )
-from tools import read_data_csv
+from modules.equipment_knowledge import search_equipment_knowledge
 from tools.equipment_tool import STATUS_LABELS, query_equipment_status
-
-
-SENSOR_FILE_NAME = "iot_sensor.csv"
-SENSOR_COLUMNS = [
-    "timestamp",
-    "equipment_id",
-    "temperature",
-    "vibration",
-    "current",
-    "status",
-]
-SENSOR_ALARM_STATUSES = ("warning", "alarm")
+from tools.iot_sensor_tool import query_latest_sensor_reading, query_sensor_readings
+from tools.production_tool import query_production_capacity
 
 
 def get_equipment(equipment_id=None, status=None, only_abnormal=False):
@@ -69,20 +63,35 @@ def get_maintenance_due_list(days=DEFAULT_MAINTENANCE_INTERVAL_DAYS, today=None)
 
 
 def get_sensor_readings(equipment_id=None, only_alarm=False):
-    """取设备传感器数据（DataFrame），经 ``tools.read_data_csv()`` 读取。"""
-    sensor_df = read_data_csv(SENSOR_FILE_NAME, SENSOR_COLUMNS)
+    """取设备传感器数据（DataFrame），委托 ``tools.iot_sensor_tool.query_sensor_readings()``。"""
+    return query_sensor_readings(equipment_id=equipment_id, only_alarm=only_alarm)
 
-    if equipment_id is not None:
-        target = str(equipment_id)
-        sensor_df = sensor_df.loc[sensor_df["equipment_id"].astype(str) == target]
 
-    if only_alarm:
-        alarm_statuses = {value.lower() for value in SENSOR_ALARM_STATUSES}
-        sensor_df = sensor_df.loc[
-            sensor_df["status"].astype(str).str.lower().isin(alarm_statuses)
-        ]
+def get_latest_sensor_reading(equipment_id=None):
+    """取最新一条传感器读数（dict），委托 ``tools.iot_sensor_tool``。"""
+    return to_jsonable(query_latest_sensor_reading(equipment_id=equipment_id))
 
-    return sensor_df.reset_index(drop=True)
+
+def get_equipment_production_status(equipment_id):
+    """取该设备在 MES 中的产线段记录（dict 列表），用于判断停机/保养状态。"""
+    lines = query_production_capacity(equipment=equipment_id)
+    return df_to_records(lines)
+
+
+def search_fault_knowledge(observation, limit=3):
+    """检索设备故障案例库（knowledge/equipment/）。
+
+    委托 ``modules/equipment_knowledge.search_equipment_knowledge()``；
+    置信度为「与知识库案例的相似度」，不是工程失效概率。
+    """
+    return to_jsonable(search_equipment_knowledge(observation, limit=limit))
+
+
+def get_fault_knowledge_count():
+    """知识库案例总数（便于自检与展示）。"""
+    from modules.equipment_knowledge import load_equipment_cases
+
+    return len(load_equipment_cases())
 
 
 def get_sensor_summary():

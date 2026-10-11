@@ -23,7 +23,8 @@ manufacturing-quality-tool/
 │   ├── inventory.csv           # 原材料库存模拟数据
 │   ├── equipment.csv           # 设备台账数据
 │   ├── production.csv          # MES 生产数据
-│   └── iot_sensor.csv          # 设备传感器数据
+│   ├── iot_sensor.csv          # 设备传感器数据
+│   └── work_orders.csv         # 维修工单（S3-A-03，调用 create_work_order() 时追加）
 │
 ├── modules/                    # 分析层
 │   ├── quality_analysis.py     # 原质量分析逻辑统一入口（原 src/data_loader.py 迁移 + 内置数据入口）
@@ -37,6 +38,7 @@ manufacturing-quality-tool/
 │   ├── order_analysis.py       # 订单分析（新增）
 │   ├── equipment_analysis.py   # 设备分析（新增）
 │   ├── inventory_analysis.py   # 库存状态口径（全项目唯一来源，页面与 Agent 共用）
+│   ├── equipment_knowledge.py  # 设备故障知识库检索（knowledge/equipment/，S3-A-01/02）
 │   └── production_analysis.py  # 生产（MES）分析（新增）
 │
 ├── tools/                      # 数据访问层：只负责读取 data/ 并返回 DataFrame
@@ -44,23 +46,26 @@ manufacturing-quality-tool/
 │   ├── order_tool.py           # query_orders()
 │   ├── inventory_tool.py       # query_inventory()
 │   ├── equipment_tool.py       # query_equipment_status()
+│   ├── iot_sensor_tool.py      # query_sensor_readings() / query_latest_sensor_reading()
 │   └── production_tool.py      # query_production_capacity()
 │
 ├── agent_tools/                # Agent 取数封装层（不复制 tools，只做封装与结构化）
 │   ├── order_tools.py          # 订单 + 生产能力取数（订单交付场景）
 │   ├── inventory_tools.py      # 库存取数（复用 modules/inventory_analysis）
-│   ├── equipment_tools.py      # 设备台账 + 传感器取数
+│   ├── equipment_tools.py      # 设备台账 + 传感器 + 故障知识库取数
+│   ├── work_order_tools.py     # create_work_order() 维修工单（S3-A-03）
 │   └── quality_tools.py        # 质量取数（包装原有质量分析）
 │
 ├── agents/                     # Agent 层
 │   ├── supervisor_agent.py     # 总控：意图解析 -> 执行计划 -> 调度子 Agent
 │   ├── order_agent.py          # 订单可交付分析（risk / reason / suggestion）
-│   ├── equipment_agent.py      # 设备健康分析
+│   ├── equipment_agent.py      # 设备异常检测 + 故障诊断 + 维修工单（S3-A-02）
 │   └── quality_agent.py        # 质量分析（包装原有质量系统）
 │
 ├── knowledge/                  # 原 RAG 知识库（知识卡 + 原始 PDF，保持原样）
+│   └── equipment/              # 设备故障案例库（24 条，S3-A-01）
 ├── sample_data/                # 原多场景演示数据（铸造/焊接/磨削/车削等，保持原样）
-├── tests/                      # 回归测试 + 运营中心测试 + Agent 测试 + 页面冒烟测试
+├── tests/                      # 回归 + 运营中心 + Agent + 设备诊断 + 页面冒烟测试
 ├── requirements.txt
 ├── run_app.bat
 └── README.md
@@ -97,6 +102,7 @@ DeepSeek AI 分析仍按原逻辑工作：仅点击「生成 AI 质量分析」�
 | `equipment.csv` | equipment_id、equipment_type、status、capacity、last_maintenance | 15 台设备（正常 10 / 预警 4 / 故障 1） |
 | `production.csv` | product、process、equipment、daily_capacity、yield_rate、status | 18 条产线 / 总日产能 16,450 件（在产 14,300 件） |
 | `iot_sensor.csv` | timestamp、equipment_id、temperature、vibration、current、status | 30 条采集记录（6 台设备 × 5 个时刻） |
+| `work_orders.csv` | 维修编号、设备、故障、优先级、负责人、建议时间、创建时间、状态、来源、依据 | 2 条示例工单；调用 `create_work_order()` 时按天递增追加 |
 
 数据一致性：`production.csv.equipment` 与 `iot_sensor.csv.equipment_id` 的取值
 全部存在于 `equipment.csv.equipment_id`，相关约束由测试保证。
@@ -183,6 +189,11 @@ data/*.csv
 | `production` | 生产 | `order_agent` | `agent_tools.order_tools` |
 | `equipment` | 设备 | `equipment_agent` | `agent_tools.equipment_tools` |
 | `quality` | 质量 | `quality_agent` | `agent_tools.quality_tools` |
+| `equipment_failure` | 设备故障 | `equipment_agent` | `agent_tools.equipment_tools` + `agent_tools.work_order_tools` |
+
+说明：`CAPABILITY_ORDER`（五维：订单/库存/生产/设备/质量）用于「综合风险」与「运营总览」；
+`equipment_failure` 是**设备级动作能力**（S3-A-04），只在用户指向具体设备时启用，
+不参与五维扩张，避免综合风险报告被单台设备诊断替换。
 
 说明：v1 的 `agents/` 只有 order / equipment / quality 三个执行 Agent，
 因此「库存」「生产」两个能力由 `order_agent` 执行（订单可交付分析本身就要用库存与产能）。
@@ -197,6 +208,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | --- | --- | --- |
 | `comprehensive_risk` | 风险、隐患、有没有问题、出问题 | **全部 5 维**（订单+库存+生产+设备+质量） |
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
+| `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
 | `mixed_query` | 同时命中多个维度 | 命中维度 |
@@ -211,6 +223,8 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 - **口述订单也能算**：`extract_entities()` 支持
   `10000件` / `15天` / `2周` / `2026-11-10` / `O001` 等写法，
   没有订单编号时按用户给出的产品、数量、交期单独测算，并与在手订单做交叉引用。
+- **设备编号与订单编号分离**：订单号只保留台账中真实存在的 `O001` 形式，
+  设备号按 `[A-Z]{2,}\d{2,}` 与设备台账比对（`CNC02` 不会被误判成订单号）。
 
 ### 执行计划示例
 
@@ -322,6 +336,74 @@ Supervisor 在 `handle()` 中额外产出**分段风险报告**，分段标题�
 }
 ```
 
+```text
+意图：设备故障诊断（equipment_failure）
+识别实体：设备编号=CNC02
+执行计划：
+  1. [设备故障] equipment_agent -> diagnose_equipment_failure
+```
+
+### 设备 Agent：异常检测 → 故障诊断 → 维修工单（Sprint 3）
+
+三级升级：**异常检测**（车队级）→ **故障诊断**（单台）→ **维修工单生成**。
+
+```bat
+python -m agents.equipment_agent                       # 车队设备健康总览
+python -m agents.equipment_agent CNC02                 # 单台设备故障诊断
+python -m agents.equipment_agent CNC02 --work-order     # 诊断并落库维修工单
+python -m agents.equipment_agent CNC02 --temperature 95 --vibration 6.2
+python -m agents.supervisor_agent "CNC02报警了，帮我分析"   # Supervisor 自动路由到设备 Agent
+```
+
+**1）设备故障知识库（S3-A-01）**：`knowledge/equipment/` 共 24 条案例，
+每条为「现象 / 可能原因 / 处理 / 适用设备 / 关联信号 / 优先级」，例如 `主轴温升异常.md`。
+检索在 `modules/equipment_knowledge.py`，打分规则固定且可解释：
+
+| 命中项 | 权重 |
+| --- | --- |
+| 数值条件命中（如 `温度>90℃` 且实测 95℃） | +3.0 |
+| 关联信号命中 | +1.5 |
+| 适用设备类型命中 | +1.5 |
+
+置信度 = `min(0.95, 总分/7)`；低于 3.0 分不视为匹配；排序固定为
+（总分降序、数值条件命中数降序、高优先级优先、案例编号升序），结果可复现。
+**只有异常设备参与信号匹配**，正常设备不会命中任何案例。
+置信度表示「与知识库案例的相似度」，不是工程失效概率或放行判定。
+
+**2）诊断输出（S3-A-02）**：`diagnose_equipment()` 直接返回任务书约定结构：
+
+```json
+{
+  "equipment": "CNC02",
+  "status": "abnormal",
+  "fault": "轴承磨损",
+  "confidence": 0.95,
+  "recommendation": ["检测轴承间隙", "更换轴承", "复核装配预紧"],
+  "possible_causes": ["长期疲劳磨损", "润滑不良", "装配预紧不当"],
+  "evidence": ["设备台账状态：warning", "振动=6.2", "振动>3.5 命中（实测 6.2）", "..."],
+  "work_order": {"维修编号": "WO-20261011-001", "优先级": "高", "负责人": "机加维修组", "...": "..."}
+}
+```
+
+异常检测口径：台账 `warning/fault`、传感器 `warning/alarm`、产线
+`stopped/maintenance`、或显式报警，任一命中即 `status=abnormal`；
+无台账与传感器数据时为 `unknown`（不误判为正常）。
+`run()` 在多 Agent 场景保持统一信封（`status` 为执行状态），
+诊断结果放在 `diagnosis` 字段，并把 `fault`/`confidence`/`recommendation`/`equipment` 提升到顶层。
+
+**3）维修工单（S3-A-03）**：`agent_tools/work_order_tools.create_work_order()` 生成
+**维修编号 / 设备 / 故障 / 优先级 / 负责人 / 建议时间**（另含创建时间/状态/来源/依据）：
+
+| 字段 | 生成规则 |
+| --- | --- |
+| 维修编号 | `WO-YYYYMMDD-NNN`，按当天已有工单递增，跨天从 001 重新开始 |
+| 优先级 | 显式指定 > 设备状态（fault→紧急、warning→高） > 诊断置信度 ≥0.8→高 > 普通 |
+| 负责人 | 显式指定 > 按设备类型分配班组（CNC/MILLING/DRILLING→机加维修组 等） |
+| 建议时间 | 创建时间 + 响应时限（紧急 4h / 高 24h / 普通 72h） |
+
+默认落库到 `data/work_orders.csv`（`persist=True`）；Agent 分析默认只生成草稿
+（`persist=False`，保持只读），CLI 加 `--work-order` 才落库。
+
 ### 质量 Agent 是「包装」不是「重写」
 
 `agents/quality_agent.py` 只调用 `agent_tools.quality_tools`，后者分别使用
@@ -360,13 +442,14 @@ Supervisor 在 `handle()` 中额外产出**分段风险报告**，分段标题�
 python -m pytest tests -q
 ```
 
-当前结果：**132 passed**。
+当前结果：**156 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
 | `tests/test_app_smoke.py` | Streamlit 端到端冒烟：两个 Tab、驾驶舱四个模块与关键指标、原有质量分析功能与报表导出 |
 | `tests/test_operations.py` | 新增数据字段与规模、五个查询工具、分析入口、数据一致性 |
 | `tests/test_agents.py` | Agent 层：分层约束、意图与实体抽取、五维风险覆盖、订单交付风险（含口述订单）、LLM 规划路径、JSON 序列化 |
+| `tests/test_equipment_diagnosis.py` | S3-A：设备知识库（≥20 条）、传感器工具、故障诊断契约、维修工单生成规则、Supervisor 设备故障路由 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat

@@ -18,12 +18,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 
 
-def read_data_csv(file_name, required_columns=None):
+def read_data_csv(file_name, required_columns=None, path=None):
     """读取 data 目录下的 CSV 数据文件。
 
     参数：
         file_name:        data/ 下的文件名，例如 "orders.csv"。
         required_columns: 可选，必须存在的字段列表；缺失时抛出 ValueError。
+        path:             可选，直接指定文件路径（用于测试或项目外数据文件）。
 
     返回：
         pandas.DataFrame。
@@ -32,11 +33,11 @@ def read_data_csv(file_name, required_columns=None):
         FileNotFoundError: 数据文件不存在。
         ValueError:        文件缺少必要字段。
     """
-    path = DATA_DIR / file_name
-    if not path.is_file():
-        raise FileNotFoundError(f"数据文件不存在：{path}")
+    target = Path(path) if path is not None else DATA_DIR / file_name
+    if not target.is_file():
+        raise FileNotFoundError(f"数据文件不存在：{target}")
 
-    df = pd.read_csv(path, encoding="utf-8-sig")
+    df = pd.read_csv(target, encoding="utf-8-sig")
 
     if required_columns:
         missing_columns = [column for column in required_columns if column not in df.columns]
