@@ -33,7 +33,7 @@ import os
 import re
 
 from agent_tools import equipment_tools, order_tools, quality_tools
-from agents import equipment_agent, order_agent, quality_agent
+from agents import equipment_agent, order_agent, planning_agent, quality_agent
 
 
 # --------------------------------------------------------------------------
@@ -83,13 +83,19 @@ CAPABILITIES = {
         "tool_module": "agent_tools.equipment_tools",
         "description": "单台设备故障诊断（台账 + 传感器 + 故障知识库 + 维修工单）",
     },
+    "production_planning": {
+        "label": "生产计划",
+        "agent": "planning_agent",
+        "tool_module": "agent_tools.planning_tools",
+        "description": "生产计划编排（订单 + 产能 + 故障设备 + 库存 + 质量风险）",
+    },
 }
 
-# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备/单议题动作能力）
+# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备/单议题/排产动作能力）
 CAPABILITY_ORDER = ["order", "inventory", "production", "equipment", "quality"]
 
-# 动作能力：只在用户指向具体设备或具体质量议题时启用
-ACTION_CAPABILITIES = ["equipment_failure", "quality_issue_analysis"]
+# 动作能力：只在用户指向具体设备、具体质量议题或明确要求排产时启用
+ACTION_CAPABILITIES = ["equipment_failure", "quality_issue_analysis", "production_planning"]
 
 # 全部能力（排序与筛选用）
 ALL_CAPABILITY_ORDER = CAPABILITY_ORDER + ACTION_CAPABILITIES
@@ -100,6 +106,7 @@ DELIVERY_CAPABILITIES = ("order", "inventory", "production")
 INTENT_LABELS = {
     "comprehensive_risk": "工厂综合风险分析",
     "order_delivery": "订单交付能力分析",
+    "production_planning": "生产计划编排",
     "equipment_failure": "设备故障诊断",
     "quality_issue_analysis": "质量议题分析",
     "equipment_query": "设备状态查询",
@@ -150,6 +157,25 @@ INTENT_RULES = (
         "keywords": ("风险", "隐患", "有没有问题", "出问题", "会不会出"),
         "capabilities": tuple(CAPABILITY_ORDER),
         "reason": "风险类问题需要交付、库存、生产、设备、质量五个维度共同支撑",
+    },
+    {
+        # 生产计划编排（S5-A-04）：排产类问题。
+        # 放在交付判定之前：「能否按时完成」是判定，而「怎么安排生产」是要求排产，
+        # 当用户明确要求排产时按更具体的排产意图处理。
+        "code": "production_planning",
+        "keywords": (
+            "生产计划",
+            "生产方案",
+            "排产",
+            "怎么安排生产",
+            "如何安排生产",
+            "怎么排产",
+            "安排生产",
+            "计划怎么排",
+            "交付计划",
+        ),
+        "capabilities": ("production_planning",),
+        "reason": "用户要求安排生产，需要订单需求 + 当前产能 + 故障设备 + 库存 + 质量风险生成排产方案",
     },
     {
         "code": "order_delivery",
@@ -241,6 +267,7 @@ SECTION_TITLES = {
     "equipment_failure": "设备故障风险",
     "quality": "质量风险",
     "quality_issue_analysis": "质量议题风险",
+    "production_planning": "生产计划风险",
 }
 
 
@@ -536,6 +563,8 @@ def _action_for(capability, entities):
         return "diagnose_equipment_failure"
     if capability == "quality_issue_analysis":
         return "analyze_quality_issue"
+    if capability == "production_planning":
+        return "generate_production_plan"
     return {
         "inventory": "get_inventory_summary",
         "production": "get_factory_capacity",
@@ -576,6 +605,16 @@ def _reason_for(capability, entities):
             f"用户关注质量下降/异常（{scope_text}），"
             "需要时间趋势对比、质量追溯（工序→设备→生产记录）与改善知识库建议"
         )
+
+    if capability == "production_planning":
+        if entities.get("order_id"):
+            return f"用户要求为订单 {entities['order_id']} 安排生产，需要产能、设备、库存与质量风险共同排产"
+        if entities.get("product") and entities.get("quantity") is not None:
+            return (
+                f"用户要求为「{entities['product']} {entities['quantity']} 件」安排生产，"
+                "需要产能、设备、库存与质量风险共同排产"
+            )
+        return "用户要求排产但未指明订单，需要先确定最紧急订单再生成生产计划"
 
     return {
         "inventory": "交付能力取决于物料齐套性，需要库存与安全库存状态",
@@ -624,6 +663,14 @@ def build_steps(capabilities, entities):
                 "batch",
                 "days",
             ):
+                value = entities.get(entity_key)
+                if value is not None:
+                    step_arguments[entity_key] = value
+            if step_arguments:
+                step["arguments"] = step_arguments
+        elif capability == "production_planning":
+            step_arguments = {}
+            for entity_key in ("order_id", "product", "quantity", "delivery_days", "deadline"):
                 value = entities.get(entity_key)
                 if value is not None:
                     step_arguments[entity_key] = value
@@ -1008,6 +1055,7 @@ AGENT_DISPATCH = {
     "order_agent": order_agent.run,
     "equipment_agent": equipment_agent.run,
     "quality_agent": quality_agent.run,
+    "planning_agent": planning_agent.run,
 }
 
 

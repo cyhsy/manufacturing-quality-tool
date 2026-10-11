@@ -39,13 +39,12 @@ import math
 
 import pandas as pd
 
-from agent_tools import df_to_records, equipment_tools, inventory_tools, order_tools
+from agent_tools import equipment_tools, inventory_tools, order_tools
+from modules import planning_engine
 
 
 NEAR_TERM_DAYS = 14
 TIGHT_RATIO = 0.8
-DERATED_PRODUCTION_STATUSES = ("maintenance", "idle")
-DERATED_EQUIPMENT_STATUSES = ("warning",)
 RISK_ORDER = ["low", "medium", "high"]
 
 
@@ -65,61 +64,18 @@ def _reference_day(today=None):
 
 
 def evaluate_capacity(product):
-    """评估某产品的产能：返回瓶颈日产能、产线明细与受阻/降额工序。"""
+    """评估某产品的产能：返回瓶颈日产能、产线明细与受阻/降额工序。
+
+    产能口径与生产计划共用同一实现（``modules/planning_engine.evaluate_effective_capacity``），
+    避免订单交付判定与排产出现两套「有效日产能」。
+    """
     lines = order_tools.get_production_lines(product=product)
     equipment_status = {
         str(record["equipment_id"]): str(record["status"]).lower()
         for record in equipment_tools.get_equipment_records()
     }
 
-    if lines.empty:
-        return {
-            "source": "factory_running_capacity",
-            "bottleneck": None,
-            "lines": [],
-            "blocked_lines": [],
-            "derated_lines": [],
-        }
-
-    evaluated = lines.copy()
-    evaluated["effective_capacity"] = (
-        pd.to_numeric(evaluated["daily_capacity"], errors="coerce").fillna(0).astype("int64")
-    )
-    production_status = evaluated["status"].astype(str).str.lower()
-    evaluated["equipment_status"] = (
-        evaluated["equipment"].astype(str).map(lambda value: equipment_status.get(value, "unknown"))
-    )
-    equipment_state = evaluated["equipment_status"]
-
-    blocked_mask = (production_status == "stopped") | (equipment_state == "fault")
-    derated_mask = (
-        production_status.isin(DERATED_PRODUCTION_STATUSES)
-        | equipment_state.isin(DERATED_EQUIPMENT_STATUSES)
-    ) & (~blocked_mask)
-
-    evaluated.loc[blocked_mask, "effective_capacity"] = 0
-    evaluated["blocked"] = blocked_mask
-    evaluated["derated"] = derated_mask
-
-    detail_columns = [
-        "process",
-        "equipment",
-        "status",
-        "equipment_status",
-        "daily_capacity",
-        "effective_capacity",
-        "blocked",
-        "derated",
-    ]
-    line_details = df_to_records(evaluated[detail_columns])
-
-    return {
-        "source": "product_process_bottleneck",
-        "bottleneck": int(evaluated["effective_capacity"].min()),
-        "lines": line_details,
-        "blocked_lines": [item for item in line_details if item["blocked"]],
-        "derated_lines": [item for item in line_details if item["derated"]],
-    }
+    return planning_engine.evaluate_effective_capacity(lines, equipment_status)
 
 
 def evaluate_delivery(product, quantity, deadline, today=None, extra_notes=None):

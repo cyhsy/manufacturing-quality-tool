@@ -25,6 +25,7 @@ manufacturing-quality-tool/
 │   ├── production.csv          # MES 生产数据
 │   ├── iot_sensor.csv          # 设备传感器数据
 │   ├── product_mapping.csv     # 产品映射层：MES 产品 -> 质量零件（S4.1-A-02）
+│   ├── bom.csv                 # 物料用量（S5-A-02，用于按订单计算物料需求）
 │   └── work_orders.csv         # 维修工单（S3-A-03，调用 create_work_order() 时追加）
 │
 ├── modules/                    # 分析层
@@ -42,6 +43,7 @@ manufacturing-quality-tool/
 │   ├── equipment_knowledge.py  # 设备故障知识库检索（knowledge/equipment/，S3-A-01/02）
 │   ├── quality_knowledge.py    # 质量改善知识库检索（knowledge/quality/，S4-A-03）
 │   ├── quality_issue_analysis.py # 质量议题趋势口径（S4-A-01）
+│   ├── planning_engine.py      # 排产规则模型（S5-A-03）
 │   ├── knowledge_base.py       # 知识库 Markdown 解析公共工具
 │   └── production_analysis.py  # 生产（MES）分析（新增）
 │
@@ -59,12 +61,14 @@ manufacturing-quality-tool/
 │   ├── inventory_tools.py      # 库存取数（复用 modules/inventory_analysis）
 │   ├── equipment_tools.py      # 设备台账 + 传感器 + 故障知识库取数
 │   ├── work_order_tools.py     # create_work_order() 维修工单（S3-A-03）
+│   ├── planning_tools.py       # generate_production_plan() 生产计划（S5-A-02）
 │   └── quality_tools.py        # 质量取数（包装原有质量分析）
 │
 ├── agents/                     # Agent 层
 │   ├── supervisor_agent.py     # 总控：意图解析 -> 执行计划 -> 调度子 Agent
 │   ├── order_agent.py          # 订单可交付分析（risk / reason / suggestion）
 │   ├── equipment_agent.py      # 设备异常检测 + 故障诊断 + 维修工单（S3-A-02）
+│   ├── planning_agent.py       # 生产计划编排（S5-A-01）
 │   └── quality_agent.py        # 质量分析（包装原有质量系统）
 │
 ├── knowledge/                  # 原 RAG 知识库（知识卡 + 原始 PDF，保持原样）
@@ -109,6 +113,7 @@ DeepSeek AI 分析仍按原逻辑工作：仅点击「生成 AI 质量分析」�
 | `production.csv` | product、process、equipment、daily_capacity、yield_rate、status | 18 条产线 / 总日产能 16,450 件（在产 14,300 件） |
 | `iot_sensor.csv` | timestamp、equipment_id、temperature、vibration、current、status | 30 条采集记录（6 台设备 × 5 个时刻） |
 | `product_mapping.csv` | mes_product、quality_part、mapping_reason | 13 条映射，覆盖 12 个 MES 产品与 8 个质量零件 |
+| `bom.csv` | product、material、unit_usage、unit | 13 条物料用量，覆盖全部 12 个 MES 产品 |
 | `work_orders.csv` | 维修编号、设备、故障、优先级、负责人、建议时间、创建时间、状态、来源、依据 | 2 条示例工单；调用 `create_work_order()` 时按天递增追加 |
 
 数据一致性：`production.csv.equipment` 与 `iot_sensor.csv.equipment_id` 的取值
@@ -197,6 +202,7 @@ data/*.csv
 | `equipment` | 设备 | `equipment_agent` | `agent_tools.equipment_tools` |
 | `quality` | 质量 | `quality_agent` | `agent_tools.quality_tools` |
 | `quality_issue_analysis` | 质量议题 | `quality_agent` | `agent_tools.quality_tools` + `tools/traceability_tool.py` |
+| `production_planning` | 生产计划 | `planning_agent` | `agent_tools.planning_tools`（-> `modules/planning_engine.py`） |
 | `equipment_failure` | 设备故障 | `equipment_agent` | `agent_tools.equipment_tools` + `agent_tools.work_order_tools` |
 
 说明：`CAPABILITY_ORDER`（五维：订单/库存/生产/设备/质量）用于「综合风险」与「运营总览」；
@@ -219,6 +225,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
 | `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
 | `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉，或**「质量域词 + 趋势词」组合**（良率下降、合格率下滑、尺寸异常） | 质量议题（趋势 + 追溯 + 改善建议） |
+| `production_planning` | 生产计划、生产方案、**排产**、怎么安排生产、如何安排生产、交付计划 | 生产计划（排产 + 风险 + 建议） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
 | `mixed_query` | 同时命中多个维度 | 命中维度 |
@@ -419,6 +426,80 @@ python -m agents.supervisor_agent "CNC02报警了，帮我分析"   # Supervisor
 默认落库到 `data/work_orders.csv`（`persist=True`）；Agent 分析默认只生成草稿
 （`persist=False`，保持只读），CLI 加 `--work-order` 才落库。
 
+### 生产计划 Agent（Sprint 5）
+
+把「订单 → 产能 → 故障设备 → 库存 → 质量」串成可执行排产方案。
+
+```bat
+python -m agents.planning_agent                                        # 最紧急在手订单
+python -m agents.planning_agent O009
+python -m agents.planning_agent --product 电机壳体 --quantity 10000 --days 15 --today 2026-10-11
+python -m agents.supervisor_agent "这个订单怎么安排生产？"
+python -m agents.supervisor_agent "10000件电机壳体，15天交付，怎么安排生产"
+```
+
+**1）规则模型（S5-A-03，`modules/planning_engine.py`，第一版不做优化算法）**
+
+| 规则 | 落地方式 |
+| --- | --- |
+| 1 优先满足交期 | 按流水（相邻工序重叠，流转 1 天）估工期，超交期即给压缩方案 |
+| 2 避开故障设备 | 停机/故障产线**自动替换**为同工序可用设备；无替代则判为 blocked |
+| 3 优先高风险订单 | 优先级 high 的订单采购按**加急 1 天**（常规 3 天）并提示预留缓冲 |
+| 4 考虑库存 | 按 `bom.csv` 算本单物料需求，缺料时在计划最前面插入采购备料阶段 |
+
+工期口径（可复现）：`d_i = ceil(数量 / 有效日产能_i)`，
+`生产工期 = max_i(流转偏移_i + d_i)`，`总工期 = 采购备料天数 + 生产工期`，
+并同时给出**串行上限** `serial_days = Σ d_i` 作参照。
+「有效日产能」与订单 Agent 共用 `evaluate_effective_capacity()` —— 停机/故障记 0，瓶颈取工序最小值。
+
+**2）实测输出（Sprint 5 场景：10000 件电机壳体，15 天交付）**
+
+```text
+risk: high   plan_status: tight
+reason: 计划总工期 17 天（采购备料 3 天 + 生产 14 天）；交期剩余 15 天，超出 2 天；
+        瓶颈工序 CNC加工（CNC01，800 件/天）；物料缺口：铝合金；设备风险 high；质量风险 high
+
+生产方案：
+  Day1-3：采购备料（铝合金）（铝合金缺口 20000kg；常规采购 3 天）
+  Day4-13：铸造（CAST01，1000 件/天，需 10 天）
+  Day5-17：CNC加工（CNC01，800 件/天，需 13 天）
+  Day6-12：装配（ASSY01，1500 件/天，需 7 天）
+  Day7-11：检测（TEST01，2000 件/天，需 5 天）
+
+风险：
+  [medium] CNC加工 工序备用设备 CNC02 停机或故障 -> 扩产时不可用（日产能 600 件）
+  [high]   铝合金 缺口 20000kg                   -> 开工前必须到料，否则计划整体顺延
+  [high]   计划工期 17 天 > 交期剩余 15 天          -> 超出 2 天，无法满足交期
+  [info]   瓶颈工序：CNC加工（CNC01，800 件/天）    -> 决定整体产出节奏
+
+建议：
+  - 启用 CNC加工 的替代/并行设备：CNC03（850 件/天），瓶颈产能 800 → 1650 件/天，启用后生产工期 10 天
+  - 将采购改为加急（3 天 → 1 天，可省 2 天）：铝合金
+  - 关键工序增加班次，产能约提升 30%（生产工期可降至 8 天）
+  - 按上述措施执行后总工期 11 天，可满足交期 15 天
+```
+
+故障设备替换实测（规则 2）：`O002`（变速箱壳体）的 CNC 工序原设备 CNC02 停机，
+计划自动改用 CNC03（850 件/天），风险从 high 降为 medium：
+
+```text
+Day5-10：CNC加工（CNC03，850 件/天，需 6 天；原设备 CNC02 停机或故障，改用替代设备 CNC03（850 件/天））
+```
+
+**3）调用关系（S5-A-01）**：`agents.planning_agent`
+
+```text
+agents.order_agent          -> 交付能力基准（delivery_baseline）
+agent_tools.inventory_tools -> 库存风险（inventory_risk）
+agent_tools.order_tools     -> 当前产能（-> tools.production_tool）
+agents.equipment_agent      -> 设备风险（equipment_risk）
+agents.quality_agent        -> 在制质量风险（quality_risk，可用 include_quality=False 关闭）
+agent_tools.planning_tools  -> 排产（generate_production_plan -> modules/planning_engine）
+```
+
+未指定订单时自动取**最紧急在手订单**（高优先级优先、交期最早优先），
+并在 `assumptions` 中显式说明；只给产品缺数量时会要求补齐，而不是静默改用其它订单。
+
 ### 质量 Agent 是「包装」不是「重写」
 
 `agents/quality_agent.py` 只调用 `agent_tools.quality_tools`，后者分别使用
@@ -532,7 +613,7 @@ risk: medium        verdict: 持平（缺陷率 4.000% → 3.996%，环比 -0.1%
 python -m pytest tests -q
 ```
 
-当前结果：**197 passed**。
+当前结果：**219 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -542,6 +623,7 @@ python -m pytest tests -q
 | `tests/test_equipment_diagnosis.py` | S3-A：设备知识库（≥20 条）、传感器工具、故障诊断契约、维修工单生成规则、Supervisor 设备故障路由 |
 | `tests/test_quality_issue.py` | S4-A：质量改善知识库（≥20 条 / 4 类）、质量追溯链路、议题趋势与改善建议、Supervisor 质量议题路由 |
 | `tests/test_quality_mapping.py` | S4.1：良率下降等组合说法的意图优先级、产品映射层、追溯映射字段、质量异常→订单交付风险 |
+| `tests/test_production_planning.py` | S5-A：四条排产规则、故障设备替换、物料缺口、日级方案、Planning Agent 取数来源、Supervisor 排产路由 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat
