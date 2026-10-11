@@ -111,6 +111,38 @@ INTENT_LABELS = {
     "overview": "制造运营总览",
 }
 
+# 质量议题分析的组合判定词：
+# 「质量域词」+「趋势词」同时命中才判定为质量议题（例如「电机壳体良率下降」），
+# 避免只靠字面短语（质量下降）而漏掉「良率下降 / 合格率下滑 / 尺寸异常」等同义说法。
+QUALITY_DOMAIN_WORDS = (
+    "质量",
+    "良率",
+    "合格率",
+    "缺陷",
+    "不良",
+    "毛刺",
+    "尺寸",
+    "划伤",
+    "超差",
+    "返工",
+    "报废",
+    "客诉",
+    "投诉",
+)
+DECLINE_WORDS = (
+    "下降",
+    "下滑",
+    "变差",
+    "恶化",
+    "走低",
+    "降低",
+    "上升",
+    "升高",
+    "超标",
+    "异常",
+    "波动",
+)
+
 # 意图规则（按顺序匹配，第一条命中即用）
 INTENT_RULES = (
     {
@@ -134,7 +166,7 @@ INTENT_RULES = (
         "reason": "用户指向具体设备的故障现象，按单台设备故障诊断 + 维修工单处理",
     },
     {
-        # 质量议题分析（S4-A-04）：质量下降 / 缺陷上升类问题
+        # 质量议题分析（S4-A-04 / S4.1-A-01）：质量下降、良率下降类问题
         "code": "quality_issue_analysis",
         "keywords": (
             "质量下降",
@@ -147,11 +179,15 @@ INTENT_RULES = (
             "不良率",
             "缺陷上升",
             "缺陷率",
+            "良率下降",
+            "良率异常",
+            "良率波动",
             "客诉",
             "投诉",
         ),
+        "keyword_groups": (QUALITY_DOMAIN_WORDS, DECLINE_WORDS),
         "capabilities": ("quality_issue_analysis",),
-        "reason": "用户报告质量下降/异常，需要按产品、缺陷与时间做议题分析、追溯与改善建议",
+        "reason": "用户报告质量下降/异常（含良率、合格率等同义说法），需要按产品、缺陷与时间做议题分析、追溯与改善建议",
     },
     {
         "code": "overview",
@@ -402,12 +438,38 @@ def _label_for(intent_code):
     return intent_code
 
 
+def _rule_matches(rule, lowered_text):
+    """判断意图规则是否命中。
+
+    两种条件满足**任一**即可（OR）：
+
+    - ``keywords``：字面短语任一命中，例如「质量下降」；
+    - ``keyword_groups``：每一组都至少命中一个
+      （组合条件，例如「质量域词 + 趋势词」= 良率下降 / 合格率下滑 / 尺寸异常）。
+    """
+    keywords = rule.get("keywords") or ()
+    groups = rule.get("keyword_groups") or ()
+
+    if not keywords and not groups:
+        return True
+
+    if keywords and any(keyword.lower() in lowered_text for keyword in keywords):
+        return True
+
+    if groups and all(
+        any(keyword.lower() in lowered_text for keyword in group) for group in groups
+    ):
+        return True
+
+    return False
+
+
 def classify(text, entities):
     """输入 + 实体 -> (意图编码, 意图名称, 能力列表, 判定理由)。"""
     lowered = str(text).lower()
 
     for rule in INTENT_RULES:
-        if not any(keyword.lower() in lowered for keyword in rule["keywords"]):
+        if not _rule_matches(rule, lowered):
             continue
         required_entity = rule.get("requires_entity")
         if required_entity and not entities.get(required_entity):

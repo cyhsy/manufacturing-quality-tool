@@ -1,10 +1,12 @@
-"""质量追溯工具（S4-A-02）。
+"""质量追溯工具（S4-A-02 / S4.1-A-02 / S4.1-A-03）。
 
 根据 **产品 / 批次 / 缺陷**（可选：工序、时间范围）查询关联链路：
 
+    MES 产品（如 电机壳体）
+        ↓ data/product_mapping.csv（产品映射层）
+    质量对象 / 质量零件（如 支架）
+        ↓ 缺陷、批次、时间过滤
     data/quality.csv（质量记录：零件名称 / 零件编号 / 批次号 / 工序 / 缺陷类型）
-        ↓ 过滤
-    涉及工序
         ↓ 工序标准化（PROCESS_EQUIVALENCE）
     data/production.csv（关联生产记录：产品 / 工序 / 设备 / 日产能 / 良率 / 状态）
         ↓ 设备编号
@@ -13,13 +15,15 @@
 数据现状说明（决定关联方式）：
 
 - ``quality.csv`` 的「零件名称」与 MES ``production.csv`` 的「产品」**没有交集**，
-  因此产品维度只在质量侧过滤；跨系统关联以「工序」为纽带；
-- MES 中找不到对应产线的工序（例如「表面处理」）会在 ``unmatched_processes``
-  中显式列出，不做静默丢弃。
+  因此需要 **产品映射层** ``data/product_mapping.csv``（MES 产品 → 质量零件）；
+  查询对象直接是质量零件时跳过映射；两者都不是时退回包含匹配；
+- 跨系统关联以「工序」为纽带，MES 中找不到对应产线的工序（例如「表面处理」）
+  会在 ``unmatched_processes`` 中显式列出，不做静默丢弃。
 """
 
 import pandas as pd
 
+from tools import read_data_csv
 from tools.equipment_tool import query_equipment_status
 from tools.iot_sensor_tool import query_latest_sensor_reading
 from tools.production_tool import query_production_capacity
@@ -28,6 +32,7 @@ from tools.quality_tool import (
     PART_CODE_COLUMN,
     PART_NAME_COLUMN,
     PROCESS_COLUMN,
+    list_part_names,
     query_quality_data,
 )
 
@@ -41,6 +46,19 @@ PROCESS_EQUIVALENCE = {
     "装配": ("装配",),
     "表面处理": (),
 }
+
+# 产品映射层（S4.1-A-02）
+PRODUCT_MAPPING_FILE_NAME = "product_mapping.csv"
+PRODUCT_MAPPING_COLUMNS = ["mes_product", "quality_part", "mapping_reason"]
+
+MES_PRODUCT_COLUMN = "mes_product"
+QUALITY_PART_COLUMN = "quality_part"
+MAPPING_REASON_COLUMN = "mapping_reason"
+
+# mapping_source 取值
+MAPPING_SOURCE_FILE = PRODUCT_MAPPING_FILE_NAME          # 经产品映射层命中
+MAPPING_SOURCE_DIRECT = "direct_quality_part"            # 查询对象本身即质量零件
+MAPPING_SOURCE_CONTAINS = "contains_match"               # 退回包含匹配
 
 TRACE_COLUMNS = [
     "日期",
@@ -58,20 +76,103 @@ TRACE_COLUMNS = [
 ]
 
 
+def load_product_mapping():
+    """读取产品映射表（data/product_mapping.csv）。"""
+    return read_data_csv(PRODUCT_MAPPING_FILE_NAME, PRODUCT_MAPPING_COLUMNS)
+
+
+def resolve_quality_parts(product):
+    """把查询对象解析为质量零件列表。
+
+    返回 dict：``original_product`` / ``mapped_quality_parts`` /
+    ``mapping_source`` / ``mapping_reason``。
+
+    解析顺序：
+        1. 查询对象本身就是质量零件 -> 直接匹配；
+        2. 命中产品映射层（MES 产品 -> 质量零件）-> 使用映射结果；
+        3. 两者都不是 -> 退回包含匹配（由调用方执行）。
+    """
+    if product is None or str(product).strip() == "":
+        return {
+            "original_product": None,
+            "mapped_quality_parts": [],
+            "mapping_source": None,
+            "mapping_reason": None,
+        }
+
+    target = str(product).strip()
+
+    if target in list_part_names():
+        return {
+            "original_product": target,
+            "mapped_quality_parts": [target],
+            "mapping_source": MAPPING_SOURCE_DIRECT,
+            "mapping_reason": "查询对象本身即质量零件",
+        }
+
+    mapping = load_product_mapping()
+    if not mapping.empty:
+        rows = mapping.loc[mapping[MES_PRODUCT_COLUMN].astype(str) == target]
+        parts = [str(value) for value in rows[QUALITY_PART_COLUMN]]
+        if parts:
+            reasons = []
+            for value in rows[MAPPING_REASON_COLUMN]:
+                text = str(value)
+                if text and text not in reasons:
+                    reasons.append(text)
+            return {
+                "original_product": target,
+                "mapped_quality_parts": parts,
+                "mapping_source": MAPPING_SOURCE_FILE,
+                "mapping_reason": "；".join(reasons),
+            }
+
+    return {
+        "original_product": target,
+        "mapped_quality_parts": [],
+        "mapping_source": MAPPING_SOURCE_CONTAINS,
+        "mapping_reason": None,
+    }
+
+
+def map_quality_parts_to_products(quality_parts):
+    """反向映射：质量零件 -> MES 产品（用于质量异常 -> 影响产品 -> 订单风险）。"""
+    targets = {str(value) for value in (quality_parts or [])}
+    if not targets:
+        return []
+
+    mapping = load_product_mapping()
+    if mapping.empty:
+        return []
+
+    rows = mapping.loc[mapping[QUALITY_PART_COLUMN].astype(str).isin(targets)]
+    return sorted({str(value) for value in rows[MES_PRODUCT_COLUMN]})
+
+
 def _to_int(value):
     number = pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0]
     return int(number)
 
 
 def filter_quality_records(product=None, batch=None, defect=None, process=None, start=None, end=None):
-    """按查询条件过滤质量记录（质量侧统一的过滤口径，供追溯与议题分析共用）。"""
+    """按查询条件过滤质量记录（质量侧统一的过滤口径，供追溯与议题分析共用）。
+
+    产品维度会先经产品映射层解析：命中映射时按映射出的质量零件**精确筛选**，
+    否则退回「零件名称 / 零件编号包含匹配」。
+    """
     records = query_quality_data(process=process, defect_type=defect)
 
     if product is not None:
-        target = str(product)
-        by_name = records[PART_NAME_COLUMN].astype(str).str.contains(target, case=False, regex=False)
-        by_code = records[PART_CODE_COLUMN].astype(str).str.contains(target, case=False, regex=False)
-        records = records.loc[by_name | by_code]
+        resolution = resolve_quality_parts(product)
+        mapped_parts = resolution["mapped_quality_parts"]
+
+        if mapped_parts:
+            records = records.loc[records[PART_NAME_COLUMN].astype(str).isin(mapped_parts)]
+        else:
+            target = str(product)
+            by_name = records[PART_NAME_COLUMN].astype(str).str.contains(target, case=False, regex=False)
+            by_code = records[PART_CODE_COLUMN].astype(str).str.contains(target, case=False, regex=False)
+            records = records.loc[by_name | by_code]
 
     if batch is not None:
         target = str(batch)
@@ -189,6 +290,7 @@ def query_traceability(
         production_records, equipment, unmatched_processes
     """
     records = filter_quality_records(product, batch, defect, process, start, end)
+    resolution = resolve_quality_parts(product)
 
     total_defects = _to_int(pd.to_numeric(records["缺陷数量"], errors="coerce").sum()) if not records.empty else 0
     total_batches = _to_int(pd.to_numeric(records["批次数量"], errors="coerce").sum()) if not records.empty else 0
@@ -211,6 +313,11 @@ def query_traceability(
     detail_columns = [column for column in TRACE_COLUMNS if column in detail.columns]
 
     return {
+        # 产品映射层结果（S4.1-A-03 约定字段）
+        "original_product": resolution["original_product"],
+        "mapped_quality_parts": resolution["mapped_quality_parts"],
+        "mapping_source": resolution["mapping_source"],
+        "mapping_reason": resolution["mapping_reason"],
         "query": {
             "product": product,
             "batch": batch,

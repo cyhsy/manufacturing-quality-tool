@@ -11,7 +11,9 @@
 - 统计口径：``modules/quality_analysis.analyze_quality_overview()``
   与 ``modules/defect_analysis`` 中原有函数（缺陷汇总、维度统计）
 - 议题趋势：``modules/quality_issue_analysis.py``（本期 vs 上期缺陷率）
-- 质量追溯：``tools/traceability_tool.py``（工序 -> 设备 -> 生产记录）
+- 质量追溯：``tools/traceability_tool.py``（MES 产品 -> 产品映射 -> 质量零件 -> 缺陷 -> 工序 -> 设备）
+- 订单影响：``agent_tools.order_tools.get_orders()`` + ``agents.order_agent.evaluate_delivery()``
+  （质量异常 -> 设备 -> 影响产品 -> 订单交付风险，S4.1-A-04）
 - 改善建议：``knowledge/quality/`` 质量改善知识库（S4-A-03）
 - 规则摘要：直接输出原有 ``generate_quality_summary()`` 的句子，不做二次加工
 - 根因知识：``modules/root_cause_engine``（原有知识库）
@@ -23,7 +25,10 @@
 - 其余                      -> low
 """
 
-from agent_tools import quality_tools
+import pandas as pd
+
+from agent_tools import order_tools, quality_tools
+from agents.order_agent import evaluate_delivery
 from modules import quality_issue_analysis
 
 
@@ -34,6 +39,130 @@ TOP_DEFECT_RATIO_THRESHOLD = 0.5
 ISSUE_DECLINE_HIGH_THRESHOLD = 0.2
 ISSUE_HIGH_SEVERITY_ALERT = 0.5
 ISSUE_IMPROVEMENT_LIMIT = 3
+
+# 订单影响（S4.1-A-04）
+ORDER_DETAIL_LIMIT = 10
+RISK_RANK = {"high": 0, "medium": 1, "low": 2, "unknown": 3}
+
+
+def _max_risk(*risks):
+    """取最严重的风险等级。"""
+    known = [item for item in risks if item in RISK_RANK]
+    if not known:
+        return "unknown"
+    return min(known, key=lambda item: RISK_RANK[item])
+
+
+# --------------------------------------------------------------------------
+# S4.1-A-04 质量异常 -> 生产设备 -> 影响产品 -> 订单风险
+# --------------------------------------------------------------------------
+
+
+def _primary_products(traceability):
+    """质量零件经产品映射反向定位到的 MES 产品（有明确映射依据）。"""
+    mapped_parts = traceability.get("mapped_quality_parts") or []
+    return quality_tools.get_products_for_quality_parts(mapped_parts)
+
+
+def _equipment_products(traceability):
+    """质量异常所涉工序/设备上在产的其它产品（共享设备，潜在影响）。"""
+    products = []
+    for record in traceability.get("production_records") or []:
+        name = str(record.get("产品") or "")
+        if name and name not in products:
+            products.append(name)
+    return products
+
+
+def assess_affected_orders(traceability, order_limit=ORDER_DETAIL_LIMIT):
+    """质量异常 -> 生产设备 -> 影响产品 -> 订单风险（S4.1-A-04）。
+
+    取数走 ``agent_tools.order_tools.get_orders()``（-> ``tools.order_tool.query_orders()``），
+    交付风险复用 ``agents.order_agent.evaluate_delivery()`` 的判定口径，
+    避免出现第二套订单风险模型。
+    """
+    if not traceability:
+        return {
+            "affected_products": [],
+            "primary_products": [],
+            "equipment_products": [],
+            "orders": [],
+            "order_count": 0,
+            "affected_order_ids": [],
+            "delivery_risk": "unknown",
+            "risk_source": None,
+        }
+
+    primary = _primary_products(traceability)
+    equipment_products = _equipment_products(traceability)
+
+    affected_products = list(primary)
+    for name in equipment_products:
+        if name not in affected_products:
+            affected_products.append(name)
+
+    orders_frame = (
+        order_tools.get_orders(product=affected_products) if affected_products else None
+    )
+    if orders_frame is None or orders_frame.empty:
+        return {
+            "affected_products": affected_products,
+            "primary_products": primary,
+            "equipment_products": equipment_products,
+            "orders": [],
+            "order_count": 0,
+            "affected_order_ids": [],
+            "delivery_risk": "unknown",
+            "risk_source": "agent_tools.order_tools.get_orders",
+        }
+
+    assessed = []
+    for _, row in orders_frame.iterrows():
+        product = str(row["product"])
+        quantity = int(pd.to_numeric(pd.Series([row["quantity"]]), errors="coerce").fillna(0).iloc[0])
+        deadline = pd.to_datetime(row["deadline"], errors="coerce")
+
+        delivery = evaluate_delivery(product=product, quantity=quantity, deadline=deadline)
+
+        assessed.append(
+            {
+                "order_id": str(row["order_id"]),
+                "customer": str(row["customer"]),
+                "product": product,
+                "quantity": quantity,
+                "deadline": None if pd.isna(deadline) else deadline.date().isoformat(),
+                "priority": str(row["priority"]),
+                "risk": delivery["risk"],
+                "reason": delivery["reason"],
+                "suggestion": delivery["suggestion"],
+                "relation": "直接映射" if product in primary else "共享设备",
+            }
+        )
+
+    assessed.sort(
+        key=lambda item: (
+            RISK_RANK.get(item["risk"], 9),
+            0 if item["relation"] == "直接映射" else 1,
+            item["deadline"] or "",
+        )
+    )
+
+    delivery_risk = min(
+        (item["risk"] for item in assessed),
+        key=lambda risk: RISK_RANK.get(risk, 9),
+        default="unknown",
+    )
+
+    return {
+        "affected_products": affected_products,
+        "primary_products": primary,
+        "equipment_products": equipment_products,
+        "orders": assessed[:order_limit],
+        "order_count": len(assessed),
+        "affected_order_ids": [item["order_id"] for item in assessed],
+        "delivery_risk": delivery_risk,
+        "risk_source": "agent_tools.order_tools.get_orders + agents.order_agent.evaluate_delivery",
+    }
 
 
 def analyze_quality(process=None, defect_type=None):
@@ -141,7 +270,7 @@ def _collect_improvements(analysis, limit=ISSUE_IMPROVEMENT_LIMIT):
     return improvements
 
 
-def _issue_verdict(analysis, traceability):
+def _issue_verdict(analysis, traceability, affected_orders=None):
     """议题分析结论 -> risk / reason / suggestion。"""
     recent = analysis["recent"]
     verdict = analysis["verdict"]
@@ -181,6 +310,13 @@ def _issue_verdict(analysis, traceability):
     if unmatched:
         reason_parts.append(
             "以下工序在 MES 无对应产线，无法自动关联设备：" + "、".join(unmatched)
+        )
+
+    if affected_orders and affected_orders.get("order_count"):
+        reason_parts.append(
+            f"影响在制订单 {affected_orders['order_count']} 张"
+            f"（交付风险 {affected_orders['delivery_risk']}）："
+            + "、".join(affected_orders["affected_order_ids"][:5])
         )
 
     if verdict == "下降" or worsened:
@@ -250,6 +386,7 @@ def analyze_quality_issue(
             "metrics": quality_issue_analysis.summarize_records(records),
             "trend": None,
             "traceability": None,
+            "affected_orders": None,
             "improvements": [],
             "findings": ["无匹配记录"],
             "knowledge_base_size": quality_tools.get_quality_knowledge_summary()["case_count"],
@@ -268,7 +405,20 @@ def analyze_quality_issue(
     )
 
     improvements = _collect_improvements(analysis)
-    risk, reason, suggestion = _issue_verdict(analysis, traceability)
+    affected_orders = assess_affected_orders(traceability)
+    risk, reason, suggestion = _issue_verdict(analysis, traceability, affected_orders)
+
+    findings = list(analysis["findings"])
+    combined_risk = _max_risk(risk, affected_orders.get("delivery_risk"))
+
+    if affected_orders["order_count"]:
+        findings.append(
+            f"影响订单：{'、'.join(affected_orders['affected_order_ids'][:5])}"
+            f"（共 {affected_orders['order_count']} 张，交付风险 {affected_orders['delivery_risk']}，"
+            f"综合风险 {combined_risk}）"
+        )
+    else:
+        findings.append("未关联到受影响订单")
 
     return {
         "agent": "quality_agent",
@@ -276,6 +426,7 @@ def analyze_quality_issue(
         "risk": risk,
         "reason": reason,
         "suggestion": suggestion,
+        "combined_risk": combined_risk,
         "scope": {
             "product": product,
             "defect_type": defect_type,
@@ -295,8 +446,9 @@ def analyze_quality_issue(
             "improved_dimensions": analysis["improved_dimensions"],
         },
         "traceability": traceability,
+        "affected_orders": affected_orders,
         "improvements": improvements,
-        "findings": analysis["findings"],
+        "findings": findings,
         "knowledge_base_size": quality_tools.get_quality_knowledge_summary()["case_count"],
     }
 

@@ -24,6 +24,7 @@ manufacturing-quality-tool/
 │   ├── equipment.csv           # 设备台账数据
 │   ├── production.csv          # MES 生产数据
 │   ├── iot_sensor.csv          # 设备传感器数据
+│   ├── product_mapping.csv     # 产品映射层：MES 产品 -> 质量零件（S4.1-A-02）
 │   └── work_orders.csv         # 维修工单（S3-A-03，调用 create_work_order() 时追加）
 │
 ├── modules/                    # 分析层
@@ -107,6 +108,7 @@ DeepSeek AI 分析仍按原逻辑工作：仅点击「生成 AI 质量分析」�
 | `equipment.csv` | equipment_id、equipment_type、status、capacity、last_maintenance | 15 台设备（正常 10 / 预警 4 / 故障 1） |
 | `production.csv` | product、process、equipment、daily_capacity、yield_rate、status | 18 条产线 / 总日产能 16,450 件（在产 14,300 件） |
 | `iot_sensor.csv` | timestamp、equipment_id、temperature、vibration、current、status | 30 条采集记录（6 台设备 × 5 个时刻） |
+| `product_mapping.csv` | mes_product、quality_part、mapping_reason | 13 条映射，覆盖 12 个 MES 产品与 8 个质量零件 |
 | `work_orders.csv` | 维修编号、设备、故障、优先级、负责人、建议时间、创建时间、状态、来源、依据 | 2 条示例工单；调用 `create_work_order()` 时按天递增追加 |
 
 数据一致性：`production.csv.equipment` 与 `iot_sensor.csv.equipment_id` 的取值
@@ -216,7 +218,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | `comprehensive_risk` | 风险、隐患、有没有问题、出问题 | **全部 5 维**（订单+库存+生产+设备+质量） |
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
 | `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
-| `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉 | 质量议题（趋势 + 追溯 + 改善建议） |
+| `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉，或**「质量域词 + 趋势词」组合**（良率下降、合格率下滑、尺寸异常） | 质量议题（趋势 + 追溯 + 改善建议） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
 | `mixed_query` | 同时命中多个维度 | 命中维度 |
@@ -228,6 +230,11 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
   只有真正调用 `quality_agent` / `equipment_agent` 才可能产出这两段，
   因此风险意图强制覆盖全部 5 个能力（任务书 S2-A-03 的原示例不含「风险」字样，
   仍严格保持订单+库存+生产三件套）。
+- **组合条件判定（S4.1-A-01）**：质量议题意图支持 `keyword_groups`，
+  即「质量域词（质量/良率/合格率/缺陷/不良/毛刺/尺寸/划伤/超差/返工/报废/客诉/投诉）
+  + 趋势词（下降/下滑/变差/恶化/走低/降低/上升/升高/超标/异常/波动）」**同时命中**，
+  因此「最近电机壳体良率下降，分析原因」能正确落到 `quality_issue_analysis`，
+  而「看看质量缺陷情况」仍走质量总览（无趋势词）。
 - **口述订单也能算**：`extract_entities()` 支持
   `10000件` / `15天` / `2周` / `2026-11-10` / `O001` 等写法，
   没有订单编号时按用户给出的产品、数量、交期单独测算，并与在手订单做交叉引用。
@@ -431,8 +438,10 @@ python -m agents.supervisor_agent "CNC02报警了，帮我分析"   # Supervisor
 python -m agents.quality_agent --issue                        # 质量议题分析（默认窗口）
 python -m agents.quality_agent --issue --defect 尺寸偏大
 python -m agents.quality_agent --issue --product 支架 --process 铣削 --batch LOT-202605-001
+python -m agents.quality_agent --issue --product 电机壳体       # MES 产品经产品映射落到质量零件
 python -m agents.quality_agent --issue --start 2026-05-01 --end 2026-05-14
-python -m agents.supervisor_agent "最近质量下降，帮我分析"      # Supervisor 自动路由
+python -m agents.supervisor_agent "最近质量下降，帮我分析"        # Supervisor 自动路由
+python -m agents.supervisor_agent "最近电机壳体良率下降，分析原因"   # S4.1 验收输入
 ```
 
 **1）趋势口径（`modules/quality_issue_analysis.py`）**：
@@ -440,18 +449,47 @@ python -m agents.supervisor_agent "最近质量下降，帮我分析"      # Sup
 默认窗口 = 可用数据跨度的一半（本数据集为 15 天），对比紧邻的等长上期；
 指标用**缺陷率 = 缺陷数量合计 / 批次数量合计**，避免只看绝对数量被产量干扰。
 
-**2）质量追溯（S4-A-02，`tools/traceability_tool.py`）**：
-产品 / 批次 / 缺陷 → 涉及工序 → 关联设备与生产记录。
-数据现状：`quality.csv` 的「零件名称」与 MES「产品」**没有交集**，
-因此产品维度只在质量侧过滤，跨系统关联以**工序**为纽带（含 `钻孔→钻削`、`铣削→CNC加工` 的工序标准化），
+**2）产品映射层（S4.1-A-02，`data/product_mapping.csv`）**：
+建立 **MES 产品 → 质量零件** 的映射（13 条，覆盖 12 个 MES 产品与 8 个质量零件），
+因为 `quality.csv` 的「零件名称」与 MES「产品」**没有交集**，不经映射无法互相查询。
+解析顺序：查询对象本身即质量零件 → 直接匹配；否则查映射表；都不是则退回包含匹配。
+`query_traceability()` 输出：
+
+```json
+{
+  "original_product": "电机壳体",
+  "mapped_quality_parts": ["支架", "法兰盘"],
+  "mapping_source": "product_mapping.csv",
+  "mapping_reason": "MES产品质量由关键零件表征；电机壳体端面配合由法兰盘表征"
+}
+```
+
+**3）质量追溯（S4-A-02 / S4.1-A-03）**：
+MES 产品 → 产品映射 → 质量对象 → 缺陷 → 工序 → 设备 → 生产记录。
+跨系统关联以**工序**为纽带（含 `钻孔→钻削`、`铣削→CNC加工` 的工序标准化），
 MES 中无对应产线的工序（如「表面处理」）在 `unmatched_processes` 中**显式列出，不静默丢弃**；
 `iot_sensor.csv` 只覆盖部分设备，未装传感器的设备其 `最新传感器` 为 `None`。
 
-**3）改善知识库（S4-A-03，`knowledge/quality/`）**：24 条案例，覆盖
+**4）改善知识库（S4-A-03，`knowledge/quality/`）**：24 条案例，覆盖
 **尺寸异常 / 表面缺陷 / 铸造缺陷 / 装配异常** 各 6 条，每条含
 **现象 / 原因 / 验证方法 / 改善措施**，并与数据集里的 7 类真实缺陷对齐。
 检索打分：关联缺陷 +3.0、适用工序 +2.0、类别 +1.5，
 置信度 = `min(0.95, 总分/6)`，低于 3.0 分（缺陷未命中）不算匹配。
+
+**5）订单关联（S4.1-A-04）**：质量异常 → 生产设备 → 影响产品 → 订单风险。
+取数走 `agent_tools.order_tools.get_orders()`（→ `tools.order_tool.query_orders()`），
+交付风险复用 `agents.order_agent.evaluate_delivery()` 的判定口径，不新增第二套订单风险模型。
+
+```text
+影响订单：O002、O013、O001、O006、O004（共 9 张，交付风险 high，综合风险 high）
+primary_products:   主轴法兰 / 减速器壳体 / 涡轮支架 / 电机壳体   ← 经产品映射反向直接定位
+equipment_products: 变速箱壳体 / 不锈钢接头 / 销轴 / 传感器外壳   ← 共享设备（潜在影响）
+relation:           直接映射 / 共享设备（逐单标注）
+```
+
+- 每条订单带 `order_id` / `customer` / `product` / `quantity` / `deadline` / `risk` / `reason` / `relation`，
+  按风险严重度排序；
+- `delivery_risk` 取受影响订单的最严重等级；`combined_risk` = max(质量风险, 交付风险)。
 
 实测输出示例（`python -m agents.quality_agent --issue`）：
 
@@ -494,7 +532,7 @@ risk: medium        verdict: 持平（缺陷率 4.000% → 3.996%，环比 -0.1%
 python -m pytest tests -q
 ```
 
-当前结果：**177 passed**。
+当前结果：**197 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -503,6 +541,7 @@ python -m pytest tests -q
 | `tests/test_agents.py` | Agent 层：分层约束、意图与实体抽取、五维风险覆盖、订单交付风险（含口述订单）、LLM 规划路径、JSON 序列化 |
 | `tests/test_equipment_diagnosis.py` | S3-A：设备知识库（≥20 条）、传感器工具、故障诊断契约、维修工单生成规则、Supervisor 设备故障路由 |
 | `tests/test_quality_issue.py` | S4-A：质量改善知识库（≥20 条 / 4 类）、质量追溯链路、议题趋势与改善建议、Supervisor 质量议题路由 |
+| `tests/test_quality_mapping.py` | S4.1：良率下降等组合说法的意图优先级、产品映射层、追溯映射字段、质量异常→订单交付风险 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat

@@ -40,7 +40,13 @@ from tools.quality_tool import (
     list_processes,
     query_quality_data,
 )
-from tools.traceability_tool import filter_quality_records, query_traceability
+from tools.traceability_tool import (
+    filter_quality_records,
+    load_product_mapping,
+    map_quality_parts_to_products,
+    query_traceability,
+    resolve_quality_parts,
+)
 
 
 HIGH_SEVERITY_VALUE = "高"
@@ -245,3 +251,23 @@ def list_process_options():
         processes.update(str(value) for value in lines["process"])
 
     return sorted(processes)
+
+
+# --------------------------------------------------------------------------
+# S4.1：产品映射层（MES 产品 <-> 质量零件）
+# --------------------------------------------------------------------------
+
+
+def get_product_mapping():
+    """产品映射表记录（data/product_mapping.csv）。"""
+    return df_to_records(load_product_mapping())
+
+
+def get_mapped_quality_parts(product):
+    """查询对象 -> 质量零件（复用产品映射层的解析口径）。"""
+    return to_jsonable(resolve_quality_parts(product))
+
+
+def get_products_for_quality_parts(quality_parts):
+    """质量零件 -> MES 产品（反向映射，用于「影响产品」定位）。"""
+    return map_quality_parts_to_products(quality_parts)
