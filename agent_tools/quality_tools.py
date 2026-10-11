@@ -22,13 +22,25 @@ from modules.defect_analysis import (
     summarize_by_dimension,
 )
 from modules.quality_analysis import analyze_quality_overview
+from modules.quality_knowledge import (
+    list_categories,
+    load_quality_cases,
+    search_quality_knowledge,
+)
 from modules.root_cause_engine import (
     find_defect_root_causes,
     get_all_process_types,
     get_defect_types_for_process,
     get_root_causes,
 )
-from tools.quality_tool import query_quality_data
+from tools.production_tool import query_production_capacity
+from tools.quality_tool import (
+    list_defect_types,
+    list_part_names,
+    list_processes,
+    query_quality_data,
+)
+from tools.traceability_tool import filter_quality_records, query_traceability
 
 
 HIGH_SEVERITY_VALUE = "高"
@@ -145,3 +157,91 @@ def find_root_causes(defect_type, process_hint=None):
         "matched_process": matched_process,
         "causes": to_jsonable(causes),
     }
+
+
+# --------------------------------------------------------------------------
+# S4-A：质量议题分析相关取数
+# --------------------------------------------------------------------------
+
+
+def get_issue_records(
+    product=None,
+    batch=None,
+    defect_type=None,
+    process=None,
+    start=None,
+    end=None,
+):
+    """按议题条件取质量记录（DataFrame）。
+
+    复用 ``tools.traceability_tool.filter_quality_records()`` 的统一过滤口径，
+    避免追溯与议题分析出现两套筛选逻辑。
+    """
+    return filter_quality_records(
+        product=product,
+        batch=batch,
+        defect=defect_type,
+        process=process,
+        start=start,
+        end=end,
+    )
+
+
+def get_traceability(
+    product=None,
+    batch=None,
+    defect=None,
+    process=None,
+    start=None,
+    end=None,
+    record_limit=20,
+):
+    """质量追溯（S4-A-02）：产品 / 批次 / 缺陷 -> 工序 / 设备 / 生产记录。"""
+    return to_jsonable(
+        query_traceability(
+            product=product,
+            batch=batch,
+            defect=defect,
+            process=process,
+            start=start,
+            end=end,
+            record_limit=record_limit,
+        )
+    )
+
+
+def search_improvement_knowledge(defect_type=None, process=None, category=None, limit=3):
+    """检索质量改善知识库（S4-A-03）。
+
+    委托 ``modules.quality_knowledge.search_quality_knowledge()``；
+    置信度为「与知识库改善案例的匹配度」，不是责任判定。
+    """
+    observation = {"缺陷类型": defect_type, "工序": process, "类别": category}
+    return to_jsonable(search_quality_knowledge(observation, limit=limit))
+
+
+def get_quality_knowledge_summary():
+    """质量改善知识库规模与类别分布。"""
+    cases = load_quality_cases()
+    return {"case_count": len(cases), "categories": list_categories(cases)}
+
+
+def list_part_options():
+    """可选零件名称（质量数据侧，用于实体识别）。"""
+    return list_part_names()
+
+
+def list_defect_options():
+    """可选缺陷类型（质量数据侧）。"""
+    return list_defect_types()
+
+
+def list_process_options():
+    """可选工序：质量数据工序 ∪ MES 工序。"""
+    processes = set(list_processes())
+
+    lines = query_production_capacity()
+    if not lines.empty:
+        processes.update(str(value) for value in lines["process"])
+
+    return sorted(processes)

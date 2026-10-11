@@ -32,7 +32,7 @@ import json
 import os
 import re
 
-from agent_tools import equipment_tools, order_tools
+from agent_tools import equipment_tools, order_tools, quality_tools
 from agents import equipment_agent, order_agent, quality_agent
 
 
@@ -71,6 +71,12 @@ CAPABILITIES = {
         "tool_module": "agent_tools.quality_tools",
         "description": "缺陷统计、严重等级与根因（复用原有质量分析）",
     },
+    "quality_issue_analysis": {
+        "label": "质量议题",
+        "agent": "quality_agent",
+        "tool_module": "agent_tools.quality_tools",
+        "description": "质量议题分析：产品/缺陷/时间 + 质量追溯 + 改善知识库（S4-A-01）",
+    },
     "equipment_failure": {
         "label": "设备故障",
         "agent": "equipment_agent",
@@ -79,11 +85,11 @@ CAPABILITIES = {
     },
 }
 
-# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备动作能力）
+# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备/单议题动作能力）
 CAPABILITY_ORDER = ["order", "inventory", "production", "equipment", "quality"]
 
-# 设备级动作能力（S3-A-04）：只在用户指向具体设备时启用
-ACTION_CAPABILITIES = ["equipment_failure"]
+# 动作能力：只在用户指向具体设备或具体质量议题时启用
+ACTION_CAPABILITIES = ["equipment_failure", "quality_issue_analysis"]
 
 # 全部能力（排序与筛选用）
 ALL_CAPABILITY_ORDER = CAPABILITY_ORDER + ACTION_CAPABILITIES
@@ -95,6 +101,7 @@ INTENT_LABELS = {
     "comprehensive_risk": "工厂综合风险分析",
     "order_delivery": "订单交付能力分析",
     "equipment_failure": "设备故障诊断",
+    "quality_issue_analysis": "质量议题分析",
     "equipment_query": "设备状态查询",
     "quality_query": "质量分析",
     "inventory_query": "库存查询",
@@ -125,6 +132,26 @@ INTENT_RULES = (
         "capabilities": ("equipment_failure",),
         "requires_entity": "equipment_id",
         "reason": "用户指向具体设备的故障现象，按单台设备故障诊断 + 维修工单处理",
+    },
+    {
+        # 质量议题分析（S4-A-04）：质量下降 / 缺陷上升类问题
+        "code": "quality_issue_analysis",
+        "keywords": (
+            "质量下降",
+            "质量变差",
+            "质量恶化",
+            "质量趋势",
+            "质量波动",
+            "质量异常",
+            "不良上升",
+            "不良率",
+            "缺陷上升",
+            "缺陷率",
+            "客诉",
+            "投诉",
+        ),
+        "capabilities": ("quality_issue_analysis",),
+        "reason": "用户报告质量下降/异常，需要按产品、缺陷与时间做议题分析、追溯与改善建议",
     },
     {
         "code": "overview",
@@ -165,6 +192,9 @@ LLM_SYSTEM_PROMPT = (
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
+# 批次号形如 LOT-202605-001
+BATCH_PATTERN = re.compile(r"LOT-[A-Za-z0-9-]+", re.IGNORECASE)
+
 RISK_ORDER = ["low", "medium", "high"]
 
 SECTION_TITLES = {
@@ -174,6 +204,7 @@ SECTION_TITLES = {
     "equipment": "设备风险",
     "equipment_failure": "设备故障风险",
     "quality": "质量风险",
+    "quality_issue_analysis": "质量议题风险",
 }
 
 
@@ -239,6 +270,57 @@ def extract_equipment_ids(text, known_equipment_ids=None):
     return sorted(candidates)
 
 
+def _known_defect_types():
+    """质量数据的缺陷类型（用于实体识别）。"""
+    try:
+        return quality_tools.list_defect_options()
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+
+
+def _known_parts():
+    """质量数据的零件名称（用于实体识别）。"""
+    try:
+        return quality_tools.list_part_options()
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+
+
+def _known_processes():
+    """可选工序：质量数据工序 ∪ MES 工序。"""
+    try:
+        return quality_tools.list_process_options()
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+
+
+def extract_named_value(text, candidates):
+    """在文本中匹配候选名称（长名优先），未命中返回 None。"""
+    content = str(text)
+    for name in sorted(candidates, key=lambda item: (-len(item), item)):
+        if name and name in content:
+            return name
+    return None
+
+
+def extract_part_name(text, candidates, product_name=None):
+    """匹配质量数据的零件名称。
+
+    「支架」是「涡轮支架」的子串：若该零件名只出现在已识别的产品名内部，
+    则不视为独立零件，避免把产品名误判为零件名。
+    """
+    content = str(text)
+    for name in sorted(candidates, key=lambda item: (-len(item), item)):
+        if not name or name not in content:
+            continue
+        if product_name and name in product_name:
+            remainder = content.replace(product_name, "")
+            if name not in remainder:
+                continue
+        return name
+    return None
+
+
 def _first_number(pattern, text):
     match = pattern.search(str(text))
     if not match:
@@ -274,12 +356,19 @@ def extract_entities(text, today=None):
     date_match = DATE_PATTERN.search(content)
     deadline = date_match.group(0) if date_match else None
 
+    product = extract_product(content)
+    batch_match = BATCH_PATTERN.search(content)
+
     entities = {
         "order_ids": order_ids,
         "order_id": order_ids[0] if order_ids else None,
         "equipment_ids": equipment_ids,
         "equipment_id": equipment_ids[0] if equipment_ids else None,
         "product": product,
+        "part_name": extract_part_name(content, _known_parts(), product_name=product),
+        "defect_type": extract_named_value(content, _known_defect_types()),
+        "process": extract_named_value(content, _known_processes()),
+        "batch": batch_match.group(0) if batch_match else None,
         "quantity": quantity,
         "delivery_days": None if delivery_days is None else int(delivery_days),
         "deadline": deadline,
@@ -345,6 +434,15 @@ def classify(text, entities):
             f"用户指向具体设备 {entities['equipment_ids'][0]}，按设备故障诊断处理",
         )
 
+    # 只给出质量侧实体（零件 / 缺陷类型 / 批次）：按质量议题分析处理
+    if entities.get("part_name") or entities.get("defect_type") or entities.get("batch"):
+        return (
+            "quality_issue_analysis",
+            _label_for("quality_issue_analysis"),
+            ["quality_issue_analysis"],
+            "用户给出了质量侧实体（零件 / 缺陷类型 / 批次），按质量议题分析处理",
+        )
+
     matched = detect_capabilities(text)
     if len(matched) == 1:
         code = f"{matched[0]}_query"
@@ -374,6 +472,8 @@ def _action_for(capability, entities):
         return "analyze_orders_overview"
     if capability == "equipment_failure":
         return "diagnose_equipment_failure"
+    if capability == "quality_issue_analysis":
+        return "analyze_quality_issue"
     return {
         "inventory": "get_inventory_summary",
         "production": "get_factory_capacity",
@@ -400,6 +500,20 @@ def _reason_for(capability, entities):
                 "需要台账状态 + 传感器读数 + 故障知识库诊断，并生成维修工单"
             )
         return "用户关注单台设备故障，需要设备故障诊断"
+
+    if capability == "quality_issue_analysis":
+        scope = []
+        if entities.get("part_name") or entities.get("product"):
+            scope.append(str(entities.get("part_name") or entities.get("product")))
+        if entities.get("defect_type"):
+            scope.append(str(entities["defect_type"]))
+        if entities.get("batch"):
+            scope.append(str(entities["batch"]))
+        scope_text = "、".join(scope) if scope else "全部产品"
+        return (
+            f"用户关注质量下降/异常（{scope_text}），"
+            "需要时间趋势对比、质量追溯（工序→设备→生产记录）与改善知识库建议"
+        )
 
     return {
         "inventory": "交付能力取决于物料齐套性，需要库存与安全库存状态",
@@ -438,6 +552,21 @@ def build_steps(capabilities, entities):
                 step["arguments"] = step_arguments
         elif capability == "equipment_failure" and entities.get("equipment_id"):
             step["arguments"] = {"equipment_id": entities["equipment_id"]}
+        elif capability == "quality_issue_analysis":
+            step_arguments = {}
+            for entity_key in (
+                "part_name",
+                "product",
+                "defect_type",
+                "process",
+                "batch",
+                "days",
+            ):
+                value = entities.get(entity_key)
+                if value is not None:
+                    step_arguments[entity_key] = value
+            if step_arguments:
+                step["arguments"] = step_arguments
 
         steps.append(step)
 
@@ -453,6 +582,11 @@ def _dispatch_arguments(entities):
         "equipment_ids",
         "equipment_id",
         "product",
+        "part_name",
+        "defect_type",
+        "process",
+        "batch",
+        "days",
         "quantity",
         "delivery_days",
         "deadline",
@@ -562,6 +696,10 @@ def explain_plan(plan):
         "order_id": "订单编号",
         "equipment_id": "设备编号",
         "product": "产品",
+        "part_name": "零件",
+        "defect_type": "缺陷类型",
+        "process": "工序",
+        "batch": "批次",
         "quantity": "数量",
         "delivery_days": "交期天数",
         "deadline": "交付日期",

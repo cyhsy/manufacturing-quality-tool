@@ -39,6 +39,9 @@ manufacturing-quality-tool/
 │   ├── equipment_analysis.py   # 设备分析（新增）
 │   ├── inventory_analysis.py   # 库存状态口径（全项目唯一来源，页面与 Agent 共用）
 │   ├── equipment_knowledge.py  # 设备故障知识库检索（knowledge/equipment/，S3-A-01/02）
+│   ├── quality_knowledge.py    # 质量改善知识库检索（knowledge/quality/，S4-A-03）
+│   ├── quality_issue_analysis.py # 质量议题趋势口径（S4-A-01）
+│   ├── knowledge_base.py       # 知识库 Markdown 解析公共工具
 │   └── production_analysis.py  # 生产（MES）分析（新增）
 │
 ├── tools/                      # 数据访问层：只负责读取 data/ 并返回 DataFrame
@@ -47,6 +50,7 @@ manufacturing-quality-tool/
 │   ├── inventory_tool.py       # query_inventory()
 │   ├── equipment_tool.py       # query_equipment_status()
 │   ├── iot_sensor_tool.py      # query_sensor_readings() / query_latest_sensor_reading()
+│   ├── traceability_tool.py    # query_traceability() 质量追溯（S4-A-02）
 │   └── production_tool.py      # query_production_capacity()
 │
 ├── agent_tools/                # Agent 取数封装层（不复制 tools，只做封装与结构化）
@@ -63,9 +67,10 @@ manufacturing-quality-tool/
 │   └── quality_agent.py        # 质量分析（包装原有质量系统）
 │
 ├── knowledge/                  # 原 RAG 知识库（知识卡 + 原始 PDF，保持原样）
-│   └── equipment/              # 设备故障案例库（24 条，S3-A-01）
+│   ├── equipment/              # 设备故障案例库（24 条，S3-A-01）
+│   └── quality/                # 质量改善案例库（24 条 / 4 类，S4-A-03）
 ├── sample_data/                # 原多场景演示数据（铸造/焊接/磨削/车削等，保持原样）
-├── tests/                      # 回归 + 运营中心 + Agent + 设备诊断 + 页面冒烟测试
+├── tests/                      # 回归 + 运营中心 + Agent + 设备诊断 + 质量议题测试
 ├── requirements.txt
 ├── run_app.bat
 └── README.md
@@ -189,11 +194,13 @@ data/*.csv
 | `production` | 生产 | `order_agent` | `agent_tools.order_tools` |
 | `equipment` | 设备 | `equipment_agent` | `agent_tools.equipment_tools` |
 | `quality` | 质量 | `quality_agent` | `agent_tools.quality_tools` |
+| `quality_issue_analysis` | 质量议题 | `quality_agent` | `agent_tools.quality_tools` + `tools/traceability_tool.py` |
 | `equipment_failure` | 设备故障 | `equipment_agent` | `agent_tools.equipment_tools` + `agent_tools.work_order_tools` |
 
 说明：`CAPABILITY_ORDER`（五维：订单/库存/生产/设备/质量）用于「综合风险」与「运营总览」；
-`equipment_failure` 是**设备级动作能力**（S3-A-04），只在用户指向具体设备时启用，
-不参与五维扩张，避免综合风险报告被单台设备诊断替换。
+`equipment_failure`（S3-A-04）与 `quality_issue_analysis`（S4-A-04）是**动作能力**，
+只在用户指向具体设备或具体质量议题时启用，不参与五维扩张，
+避免综合风险报告被单台设备诊断或单个质量议题替换。
 
 说明：v1 的 `agents/` 只有 order / equipment / quality 三个执行 Agent，
 因此「库存」「生产」两个能力由 `order_agent` 执行（订单可交付分析本身就要用库存与产能）。
@@ -209,6 +216,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | `comprehensive_risk` | 风险、隐患、有没有问题、出问题 | **全部 5 维**（订单+库存+生产+设备+质量） |
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
 | `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
+| `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉 | 质量议题（趋势 + 追溯 + 改善建议） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
 | `mixed_query` | 同时命中多个维度 | 命中维度 |
@@ -414,6 +422,50 @@ python -m agents.supervisor_agent "CNC02报警了，帮我分析"   # Supervisor
 测试 `test_quality_agent_wraps_existing_quality_system` 断言 Agent 的
 `summary_lines` 与原函数输出完全一致、`total_defects` 与原统计一致。
 
+### 质量议题分析（Sprint 4）
+
+在原有质量总览之上新增二级能力 `quality_issue_analysis`：按 **产品 / 缺陷 / 时间** 定位问题，
+串起「趋势 → 追溯 → 改善」三步。
+
+```bat
+python -m agents.quality_agent --issue                        # 质量议题分析（默认窗口）
+python -m agents.quality_agent --issue --defect 尺寸偏大
+python -m agents.quality_agent --issue --product 支架 --process 铣削 --batch LOT-202605-001
+python -m agents.quality_agent --issue --start 2026-05-01 --end 2026-05-14
+python -m agents.supervisor_agent "最近质量下降，帮我分析"      # Supervisor 自动路由
+```
+
+**1）趋势口径（`modules/quality_issue_analysis.py`）**：
+以数据中**最新日期**为基准（不用系统当天，避免数据滞后导致窗口为空），
+默认窗口 = 可用数据跨度的一半（本数据集为 15 天），对比紧邻的等长上期；
+指标用**缺陷率 = 缺陷数量合计 / 批次数量合计**，避免只看绝对数量被产量干扰。
+
+**2）质量追溯（S4-A-02，`tools/traceability_tool.py`）**：
+产品 / 批次 / 缺陷 → 涉及工序 → 关联设备与生产记录。
+数据现状：`quality.csv` 的「零件名称」与 MES「产品」**没有交集**，
+因此产品维度只在质量侧过滤，跨系统关联以**工序**为纽带（含 `钻孔→钻削`、`铣削→CNC加工` 的工序标准化），
+MES 中无对应产线的工序（如「表面处理」）在 `unmatched_processes` 中**显式列出，不静默丢弃**；
+`iot_sensor.csv` 只覆盖部分设备，未装传感器的设备其 `最新传感器` 为 `None`。
+
+**3）改善知识库（S4-A-03，`knowledge/quality/`）**：24 条案例，覆盖
+**尺寸异常 / 表面缺陷 / 铸造缺陷 / 装配异常** 各 6 条，每条含
+**现象 / 原因 / 验证方法 / 改善措施**，并与数据集里的 7 类真实缺陷对齐。
+检索打分：关联缺陷 +3.0、适用工序 +2.0、类别 +1.5，
+置信度 = `min(0.95, 总分/6)`，低于 3.0 分（缺陷未命中）不算匹配。
+
+实测输出示例（`python -m agents.quality_agent --issue`）：
+
+```text
+risk: medium        verdict: 持平（缺陷率 4.000% → 3.996%，环比 -0.1%）
+本期：49 条记录 / 398 件缺陷 / 缺陷率 3.996%；主要缺陷 尺寸偏大，主要工序 铣削
+环比恶化维度：尺寸偏大（38→102 件）、毛刺（47→87 件）、热处理（21→68 件）
+改善建议：尺寸偏大→QI-001（匹配度 0.83）按刀具寿命强制换刀 / 加工前预热主轴
+          毛刺→QI-008    孔径超差→QI-003
+```
+
+注意：该数据集整体缺陷率**环比持平**，所以分析如实给出「持平」，
+同时指出具体恶化的缺陷类型与工序 —— 不为迎合"质量下降"的提问而编造趋势。
+
 ### LLM 规划（默认优先、规则兜底）
 
 `build_plan(use_llm=None)` 为默认行为：**配置了 `DEEPSEEK_API_KEY` 就用 LLM 规划，否则用规则**；
@@ -442,7 +494,7 @@ python -m agents.supervisor_agent "CNC02报警了，帮我分析"   # Supervisor
 python -m pytest tests -q
 ```
 
-当前结果：**156 passed**。
+当前结果：**177 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -450,6 +502,7 @@ python -m pytest tests -q
 | `tests/test_operations.py` | 新增数据字段与规模、五个查询工具、分析入口、数据一致性 |
 | `tests/test_agents.py` | Agent 层：分层约束、意图与实体抽取、五维风险覆盖、订单交付风险（含口述订单）、LLM 规划路径、JSON 序列化 |
 | `tests/test_equipment_diagnosis.py` | S3-A：设备知识库（≥20 条）、传感器工具、故障诊断契约、维修工单生成规则、Supervisor 设备故障路由 |
+| `tests/test_quality_issue.py` | S4-A：质量改善知识库（≥20 条 / 4 类）、质量追溯链路、议题趋势与改善建议、Supervisor 质量议题路由 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat

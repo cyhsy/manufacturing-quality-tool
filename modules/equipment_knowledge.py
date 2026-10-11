@@ -47,6 +47,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from modules.knowledge_base import parse_case_text, split_list
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge" / "equipment"
@@ -79,63 +81,23 @@ HIGH_PRIORITY = "高"
 
 
 def parse_case(text, fallback_title=""):
-    """解析单条案例 Markdown -> dict。"""
-    title = ""
-    metadata = {}
-    sections = {key: [] for key in SECTION_KEYS}
-    current_section = None
-
-    for raw_line in str(text).splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        if line.startswith("#"):
-            if not title:
-                title = line.lstrip("#").strip()
-            continue
-
-        # 段落标题，例如 "现象:"
-        if line.endswith((":", "：")):
-            name = line[:-1].strip()
-            if name in SECTION_KEYS:
-                current_section = name
-                continue
-
-        matched = False
-        if ":" in line or "：" in line:
-            separator = ":" if ":" in line else "："
-            key, _, value = line.partition(separator)
-            key = key.strip()
-            value = value.strip()
-
-            if key in SECTION_KEYS and value:
-                sections[key].append(value)
-                current_section = key
-                matched = True
-            elif key in METADATA_KEYS:
-                metadata[key] = value
-                current_section = None
-                matched = True
-
-        if not matched and current_section:
-            sections[current_section].append(line.lstrip("-").strip())
-
-    signals = [
-        item.strip()
-        for item in re.split(r"[,，、]", metadata.get("关联信号", ""))
-        if item.strip()
-    ]
+    """解析单条案例 Markdown -> dict（解析逻辑复用 modules/knowledge_base.py）。"""
+    title, metadata, sections = parse_case_text(
+        text,
+        section_keys=SECTION_KEYS,
+        metadata_keys=METADATA_KEYS,
+        fallback_title=fallback_title,
+    )
 
     return {
         "案例编号": metadata.get("案例编号", fallback_title),
         "标题": title or fallback_title,
         "适用设备": metadata.get("适用设备", ""),
-        "关联信号": signals,
+        "关联信号": split_list(metadata.get("关联信号", "")),
         "优先级": metadata.get("优先级", "中"),
-        "现象": sections["现象"],
-        "可能原因": sections["可能原因"],
-        "处理": sections["处理"],
+        "现象": sections.get("现象", []),
+        "可能原因": sections.get("可能原因", []),
+        "处理": sections.get("处理", []),
     }
 
 

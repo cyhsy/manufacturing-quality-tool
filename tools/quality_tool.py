@@ -16,6 +16,9 @@ PROCESS_COLUMN = "工序"
 DEFECT_TYPE_COLUMN = "缺陷类型"
 SEVERITY_COLUMN = "严重等级"
 HANDLING_STATUS_COLUMN = "处理状态"
+PART_NAME_COLUMN = "零件名称"
+PART_CODE_COLUMN = "零件编号"
+BATCH_COLUMN = "批次号"
 
 
 def query_quality_data(
@@ -45,3 +48,36 @@ def query_quality_data(
     df = filter_by_values(df, HANDLING_STATUS_COLUMN, handling_status)
 
     return df.reset_index(drop=True)
+
+
+def _unique_values(column):
+    """质量数据中某字段的去重取值（升序）。"""
+    df = query_quality_data()
+    if df.empty or column not in df.columns:
+        return []
+    return sorted({str(value) for value in df[column].dropna()})
+
+
+def list_part_names():
+    """全部零件名称（升序）。"""
+    return _unique_values(PART_NAME_COLUMN)
+
+
+def list_part_codes():
+    """全部零件编号（升序）。"""
+    return _unique_values(PART_CODE_COLUMN)
+
+
+def list_defect_types():
+    """全部缺陷类型（升序）。"""
+    return _unique_values(DEFECT_TYPE_COLUMN)
+
+
+def list_processes():
+    """质量数据中出现过的工序（升序）。"""
+    return _unique_values(PROCESS_COLUMN)
+
+
+def list_batches():
+    """全部批次号（升序）。"""
+    return _unique_values(BATCH_COLUMN)
