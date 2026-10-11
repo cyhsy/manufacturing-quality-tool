@@ -34,6 +34,7 @@ import re
 
 from agent_tools import equipment_tools, order_tools, quality_tools
 from agents import equipment_agent, order_agent, planning_agent, quality_agent
+from modules import decision_engine, decision_report
 
 
 # --------------------------------------------------------------------------
@@ -89,13 +90,35 @@ CAPABILITIES = {
         "tool_module": "agent_tools.planning_tools",
         "description": "生产计划编排（订单 + 产能 + 故障设备 + 库存 + 质量风险）",
     },
+    "decision_fusion": {
+        "label": "决策融合",
+        "agent": "decision_engine",
+        "tool_module": "modules.decision_engine + agent_tools.cost_tools",
+        "description": "成本比较与综合建议（S6-A-02/A-03），并输出制造决策报告（S6-A-04）",
+    },
 }
 
-# 五个运营维度：用于「综合风险 / 运营总览」（不包含单台设备/单议题/排产动作能力）
+# 五个运营维度：用于「综合风险 / 运营总览」（不包含动作能力）
 CAPABILITY_ORDER = ["order", "inventory", "production", "equipment", "quality"]
 
-# 动作能力：只在用户指向具体设备、具体质量议题或明确要求排产时启用
-ACTION_CAPABILITIES = ["equipment_failure", "quality_issue_analysis", "production_planning"]
+# 动作能力：只在用户指向具体设备、具体质量议题、明确要求排产，
+# 或要求整体优化生产方案（多 Agent 协同任务）时启用
+ACTION_CAPABILITIES = [
+    "equipment_failure",
+    "quality_issue_analysis",
+    "production_planning",
+    "decision_fusion",
+]
+
+# 多 Agent 协同任务（Sprint 6）：一句话触发 5 步协同决策
+MANUFACTURING_OPTIMIZATION_TASK = "manufacturing_optimization"
+MANUFACTURING_OPTIMIZATION_CHAIN = (
+    "order",
+    "production_planning",
+    "equipment",
+    "quality",
+    "decision_fusion",
+)
 
 # 全部能力（排序与筛选用）
 ALL_CAPABILITY_ORDER = CAPABILITY_ORDER + ACTION_CAPABILITIES
@@ -105,6 +128,7 @@ DELIVERY_CAPABILITIES = ("order", "inventory", "production")
 
 INTENT_LABELS = {
     "comprehensive_risk": "工厂综合风险分析",
+    "manufacturing_optimization": "制造运营优化决策",
     "order_delivery": "订单交付能力分析",
     "production_planning": "生产计划编排",
     "equipment_failure": "设备故障诊断",
@@ -157,6 +181,29 @@ INTENT_RULES = (
         "keywords": ("风险", "隐患", "有没有问题", "出问题", "会不会出"),
         "capabilities": tuple(CAPABILITY_ORDER),
         "reason": "风险类问题需要交付、库存、生产、设备、质量五个维度共同支撑",
+    },
+    {
+        # 制造运营优化（Sprint 6）：多 Agent 协同决策任务。
+        # 放在排产/交付判定之前：「帮我优化生产方案」要的是整体优化决策，
+        # 而不是单一的排产结果或交付判定。
+        "code": MANUFACTURING_OPTIMIZATION_TASK,
+        "keywords": (
+            "优化生产方案",
+            "优化方案",
+            "优化排产",
+            "优化建议",
+            "综合优化",
+            "交付压力",
+            "制造决策",
+            "决策报告",
+            "帮我优化",
+            "怎么优化",
+        ),
+        "capabilities": MANUFACTURING_OPTIMIZATION_CHAIN,
+        "reason": (
+            "用户要求优化生产方案，属于多 Agent 协同任务："
+            "订单风险 → 排产方案 → 设备风险 → 质量风险 → 成本比较与综合建议"
+        ),
     },
     {
         # 生产计划编排（S5-A-04）：排产类问题。
@@ -268,6 +315,7 @@ SECTION_TITLES = {
     "quality": "质量风险",
     "quality_issue_analysis": "质量议题风险",
     "production_planning": "生产计划风险",
+    "decision_fusion": "综合决策",
 }
 
 
@@ -565,6 +613,8 @@ def _action_for(capability, entities):
         return "analyze_quality_issue"
     if capability == "production_planning":
         return "generate_production_plan"
+    if capability == "decision_fusion":
+        return "build_decision"
     return {
         "inventory": "get_inventory_summary",
         "production": "get_factory_capacity",
@@ -616,6 +666,12 @@ def _reason_for(capability, entities):
             )
         return "用户要求排产但未指明订单，需要先确定最紧急订单再生成生产计划"
 
+    if capability == "decision_fusion":
+        return (
+            "需要融合订单、质量、设备风险与排产方案，比较成本与收益后给出综合建议，"
+            "并输出制造决策报告"
+        )
+
     return {
         "inventory": "交付能力取决于物料齐套性，需要库存与安全库存状态",
         "production": "交付能力取决于瓶颈产能，需要 MES 产线与在产产能",
@@ -637,6 +693,7 @@ def build_steps(capabilities, entities):
             "tool_module": meta["tool_module"],
             "action": _action_for(capability, entities),
             "reason": _reason_for(capability, entities),
+            "depends_on": [],
         }
 
         if capability in DELIVERY_CAPABILITIES:
@@ -676,6 +733,10 @@ def build_steps(capabilities, entities):
                     step_arguments[entity_key] = value
             if step_arguments:
                 step["arguments"] = step_arguments
+
+        # 决策融合步骤依赖前面全部步骤的结果（多 Agent 协同）
+        if capability == "decision_fusion":
+            step["depends_on"] = list(range(1, index))
 
         steps.append(step)
 
@@ -733,6 +794,7 @@ def build_plan(user_input, use_llm=None, llm_client_factory=None):
         "steps": steps,
         "planner": "rule",
         "risk_focus": intent_code == "comprehensive_risk",
+        "task": intent_code if intent_code == MANUFACTURING_OPTIMIZATION_TASK else None,
         "notes": [],
     }
 
@@ -824,9 +886,13 @@ def explain_plan(plan):
 
     lines.append("执行计划：")
     for step in plan["steps"]:
+        dependency = step.get("depends_on") or []
+        suffix = (
+            f"，依赖步骤 {'、'.join(str(item) for item in dependency)}" if dependency else ""
+        )
         lines.append(
             f"  {step['step']}. [{step['capability_label']}] {step['agent']} -> {step['action']}"
-            f"（{step['reason']}）"
+            f"（{step['reason']}{suffix}）"
         )
 
     for note in plan.get("notes", []):
@@ -1048,6 +1114,150 @@ def build_risk_report(plan, results):
 
 
 # --------------------------------------------------------------------------
+# 多 Agent 协同任务（Sprint 6）：制造运营优化
+# --------------------------------------------------------------------------
+
+
+def run_manufacturing_optimization(
+    arguments=None,
+    user_input=None,
+    generate_report=True,
+    reports_dir=None,
+    generated_at=None,
+):
+    """制造运营优化：多 Agent 顺序协同 -> 决策融合 -> 制造决策报告。
+
+    步骤（对应 S6-A-01 的任务类型 ``manufacturing_optimization``）：
+
+    1. **Order Agent**        查订单、交付风险
+    2. **Planning Agent**     生成排产方案
+    3. **Equipment Agent**    检查设备风险
+    4. **Quality Agent**      检查质量风险
+    5. **决策融合层**          成本比较 + 综合建议 + 输出 Markdown 报告
+
+    说明：Planning Agent 内部也会取设备与质量风险用于排产；这里再独立调用
+    第 3、4 步，是为了让各 Agent 的风险结论单独成节并参与决策融合，
+    报告中可以分别引用（本地 CSV 读取，重复调用无外部开销）。
+    """
+    arguments = dict(arguments or {})
+    today = arguments.get("today")
+    order_id = arguments.get("order_id")
+    product = arguments.get("product")
+    quantity = arguments.get("quantity")
+    delivery_days = arguments.get("delivery_days")
+    deadline = arguments.get("deadline")
+
+    results = {}
+
+    # 1）Order Agent：订单与交付风险
+    order_arguments = {"today": today} if today else {}
+    if order_id:
+        order_arguments["order_id"] = order_id
+    elif product and quantity is not None:
+        # 口述订单：按用户给出的产品/数量/交期做交付能力分析
+        order_arguments.update({"product": product, "quantity": quantity})
+        if delivery_days is not None:
+            order_arguments["delivery_days"] = delivery_days
+        if deadline is not None:
+            order_arguments["deadline"] = deadline
+    results["order_agent"] = order_agent.run(
+        capabilities=["order"], arguments=order_arguments
+    )
+
+    # 2）Planning Agent：排产方案
+    plan_result = planning_agent.build_plan(
+        order_id=order_id,
+        product=product,
+        quantity=quantity,
+        delivery_days=delivery_days,
+        deadline=deadline,
+        today=today,
+    )
+    plan_result["capabilities"] = ["production_planning"]
+    results["planning_agent"] = plan_result
+
+    # 若未指定订单，Planning Agent 会选出最紧急订单，据此补取订单风险
+    resolved_order_id = (plan_result.get("request") or {}).get("order_id")
+    if resolved_order_id and not order_id:
+        resolved_arguments = {"order_id": resolved_order_id}
+        if today:
+            resolved_arguments["today"] = today
+        results["order_agent"] = order_agent.run(
+            capabilities=["order"], arguments=resolved_arguments
+        )
+
+    # 3）Equipment Agent：设备风险
+    results["equipment_agent"] = equipment_agent.run(
+        capabilities=["equipment"], arguments={"today": today} if today else {}
+    )
+
+    # 4）Quality Agent：质量风险
+    results["quality_agent"] = quality_agent.run(capabilities=["quality"])
+
+    # 5）决策融合 + 成本比较 + 制造决策报告
+    plan = plan_result.get("plan")
+    if not plan or plan.get("status") == "error":
+        results["decision_engine"] = {
+            "agent": "decision_engine",
+            "status": "error",
+            "capabilities": ["decision_fusion"],
+            "risk": "unknown",
+            "reason": plan_result.get("reason") or "缺少可排产的订单或产品需求",
+            "suggestion": plan_result.get("suggestion"),
+            "decision": None,
+            "decision_report": None,
+            "report_path": None,
+        }
+        return results
+
+    decision = decision_engine.build_decision(
+        plan,
+        order_risk=results["order_agent"],
+        quality_risk=results["quality_agent"],
+        equipment_risk=results["equipment_agent"],
+    )
+
+    context = {
+        "user_input": user_input,
+        "generated_at": generated_at,
+        "reference_date": (plan.get("timeline") or {}).get("today"),
+        "assumptions": plan_result.get("assumptions") or [],
+        "sources": {
+            "订单": "agents.order_agent -> agent_tools.order_tools -> tools.order_tool",
+            "排产": "agents.planning_agent -> agent_tools.planning_tools -> modules.planning_engine",
+            "设备": "agents.equipment_agent -> agent_tools.equipment_tools -> tools.equipment_tool",
+            "质量": "agents.quality_agent -> agent_tools.quality_tools -> tools.quality_tool",
+            "成本": "agent_tools.cost_tools -> modules.cost_model",
+            "决策": "modules.decision_engine.build_decision()",
+        },
+    }
+
+    markdown = None
+    report_path = None
+    if generate_report:
+        markdown = decision_report.render_decision_report(decision, context)
+        report_path = decision_report.write_decision_report(
+            decision, context, reports_dir=reports_dir
+        )
+
+    results["decision_engine"] = {
+        "agent": "decision_engine",
+        "status": "ok",
+        "capabilities": ["decision_fusion"],
+        "risk": (decision.get("risks") or {}).get("overall"),
+        "reason": (decision.get("recommendation") or {}).get("reason"),
+        "suggestion": "；".join(
+            (decision.get("recommendation") or {}).get("actions") or []
+        ),
+        "decision": decision,
+        "decision_report": markdown,
+        "report_path": report_path,
+    }
+
+    return results
+
+
+# --------------------------------------------------------------------------
 # 调度执行
 # --------------------------------------------------------------------------
 
@@ -1059,12 +1269,25 @@ AGENT_DISPATCH = {
 }
 
 
-def execute_plan(plan):
+def execute_plan(plan, generate_report=True, reports_dir=None):
     """按计划调度子 Agent。
 
-    同一个 Agent 的多个能力会被合并成一次调用；单个 Agent 失败时只记录该 Agent 的
-    error 结果，不影响计划中其它 Agent 的执行。
+    多 Agent 协同任务（``manufacturing_optimization``）走
+    :func:`run_manufacturing_optimization` 的顺序协同流程；
+    其余计划按 Agent 分组并行执行 —— 同一个 Agent 的多个能力会被合并成一次调用，
+    单个 Agent 失败时只记录该 Agent 的 error 结果，不影响计划中其它 Agent 的执行。
     """
+    if plan.get("task") == MANUFACTURING_OPTIMIZATION_TASK:
+        return {
+            "plan": plan,
+            "results": run_manufacturing_optimization(
+                arguments=_dispatch_arguments(plan.get("entities") or {}),
+                user_input=plan.get("user_input"),
+                generate_report=generate_report,
+                reports_dir=reports_dir,
+            ),
+        }
+
     grouped = {}
     for step in plan["steps"]:
         grouped.setdefault(step["agent"], []).append(step["capability"])
@@ -1095,11 +1318,16 @@ def execute_plan(plan):
     return {"plan": plan, "results": results}
 
 
-def handle(user_input, use_llm=None, llm_client_factory=None):
-    """Supervisor 主入口：生成执行计划、调度子 Agent，并汇总分段风险报告。"""
+def handle(user_input, use_llm=None, llm_client_factory=None, generate_report=True, reports_dir=None):
+    """Supervisor 主入口：生成执行计划、调度子 Agent，并汇总分段风险报告。
+
+    多 Agent 协同任务会额外返回 ``decision``（决策融合结果）、
+    ``decision_report``（Markdown 文本）与 ``report_path``（报告落盘路径）。
+    """
     plan = build_plan(user_input, use_llm=use_llm, llm_client_factory=llm_client_factory)
-    execution = execute_plan(plan)
-    return {
+    execution = execute_plan(plan, generate_report=generate_report, reports_dir=reports_dir)
+
+    payload = {
         "user_input": plan["user_input"],
         "intent": plan["intent"],
         "intent_code": plan["intent_code"],
@@ -1107,6 +1335,14 @@ def handle(user_input, use_llm=None, llm_client_factory=None):
         "results": execution["results"],
         "risk_report": build_risk_report(plan, execution["results"]),
     }
+
+    decision_step = execution["results"].get("decision_engine") or {}
+    if decision_step.get("decision") is not None:
+        payload["decision"] = decision_step["decision"]
+        payload["decision_report"] = decision_step.get("decision_report")
+        payload["report_path"] = decision_step.get("report_path")
+
+    return payload
 
 
 def main():
@@ -1126,6 +1362,8 @@ def main():
     parser.add_argument("--llm", action="store_true", help="强制启用 LLM 辅助规划")
     parser.add_argument("--no-llm", action="store_true", help="强制使用规则规划（不调用 LLM）")
     parser.add_argument("--plan-only", action="store_true", help="只输出执行计划，不执行子 Agent")
+    parser.add_argument("--no-report", action="store_true", help="不为优化任务生成 Markdown 报告")
+    parser.add_argument("--report-dir", help="报告输出目录，默认 reports/")
     args = parser.parse_args()
 
     user_input = " ".join(args.query).strip() or "分析订单O001能否按时完成"
@@ -1140,9 +1378,20 @@ def main():
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return
 
-    execution = execute_plan(plan)
+    execution = execute_plan(
+        plan,
+        generate_report=not args.no_report,
+        reports_dir=args.report_dir,
+    )
     report = build_risk_report(plan, execution["results"])
-    print(json.dumps({"results": execution["results"], "risk_report": report}, ensure_ascii=False, indent=2))
+
+    payload = {"results": execution["results"], "risk_report": report}
+    decision_step = execution["results"].get("decision_engine") or {}
+    if decision_step.get("decision") is not None:
+        payload["decision"] = decision_step["decision"]
+        payload["report_path"] = decision_step.get("report_path")
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

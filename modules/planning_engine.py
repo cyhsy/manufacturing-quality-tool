@@ -235,6 +235,58 @@ def simulate_makespan(stages, quantity, extra_capacity=None, transfer_days=TRANS
     return makespan or None
 
 
+MEASURE_EXPRESS_PURCHASE = "express_purchase"
+MEASURE_ENABLE_EQUIPMENT = "enable_equipment"
+MEASURE_SHIFT = "shift"
+
+
+def simulate_scenario(stages, quantity, material_days, measures, transfer_days=TRANSFER_DAYS):
+    """按「措施组合」模拟总工期（决策融合层 S6-A-02 使用）。
+
+    措施类型：
+
+    - ``express_purchase``：采购加急，备料天数取加急天数；
+    - ``enable_equipment``：启用替代/并行设备（``process`` + ``capacity``）；
+    - ``shift``：关键工序增加班次（``ratio``，缺省 ``SHIFT_BOOST_RATIO``）。
+
+    返回：``{"purchase_days", "production_days", "total_days", "extra_capacity"}``。
+    """
+    extra_capacity = {}
+    purchase_days = _to_int(material_days)
+
+    for measure in measures or []:
+        kind = str(measure.get("type"))
+
+        if kind == MEASURE_EXPRESS_PURCHASE:
+            if purchase_days > 0:
+                purchase_days = min(purchase_days, PURCHASE_LEAD_DAYS_EXPRESS)
+
+        elif kind == MEASURE_ENABLE_EQUIPMENT:
+            process = str(measure.get("process"))
+            extra_capacity[process] = extra_capacity.get(process, 0) + _to_int(
+                measure.get("capacity")
+            )
+
+        elif kind == MEASURE_SHIFT:
+            ratio = float(measure.get("ratio", SHIFT_BOOST_RATIO))
+            for stage in stages or []:
+                boost = int(_to_int(stage.get("effective_capacity")) * ratio)
+                if boost > 0:
+                    extra_capacity[stage["process"]] = (
+                        extra_capacity.get(stage["process"], 0) + boost
+                    )
+
+    production_days = simulate_makespan(stages, quantity, extra_capacity, transfer_days)
+    total_days = None if production_days is None else production_days + purchase_days
+
+    return {
+        "purchase_days": purchase_days,
+        "production_days": production_days,
+        "total_days": total_days,
+        "extra_capacity": extra_capacity,
+    }
+
+
 def _day_label(start_day, days):
     if days is None or days <= 0:
         return None
@@ -510,8 +562,6 @@ def build_suggestions(stages, quantity, timeline, material, priority):
 
     # 2）采购加急
     if material["shortage_materials"] and not material["express"]:
-        accelerated = dict(extra_capacity)
-        simulated = simulate_makespan(stages, quantity, accelerated)
         saved = PURCHASE_LEAD_DAYS - PURCHASE_LEAD_DAYS_EXPRESS
         suggestions.append(
             f"将采购改为加急（{PURCHASE_LEAD_DAYS} 天 → {PURCHASE_LEAD_DAYS_EXPRESS} 天，"
@@ -541,8 +591,13 @@ def build_suggestions(stages, quantity, timeline, material, priority):
         for process, value in shift_extra.items():
             best_extra[process] = best_extra.get(process, 0) + value
         best_production = simulate_makespan(stages, quantity, best_extra)
+        best_material_days = (
+            PURCHASE_LEAD_DAYS_EXPRESS
+            if material["shortage_materials"]
+            else material["purchase_days"]
+        )
         best_total = (
-            best_production + material["purchase_days"] if best_production is not None else None
+            best_production + best_material_days if best_production is not None else None
         )
         if best_total is not None and best_total <= timeline["available_days"]:
             suggestions.append(

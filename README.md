@@ -44,6 +44,9 @@ manufacturing-quality-tool/
 │   ├── quality_knowledge.py    # 质量改善知识库检索（knowledge/quality/，S4-A-03）
 │   ├── quality_issue_analysis.py # 质量议题趋势口径（S4-A-01）
 │   ├── planning_engine.py      # 排产规则模型（S5-A-03）
+│   ├── cost_model.py           # 成本模型（S6-A-03：加急/加班/换线/延期）
+│   ├── decision_engine.py      # 决策融合层（S6-A-02）
+│   ├── decision_report.py      # 制造决策报告渲染（S6-A-04）
 │   ├── knowledge_base.py       # 知识库 Markdown 解析公共工具
 │   └── production_analysis.py  # 生产（MES）分析（新增）
 │
@@ -62,6 +65,7 @@ manufacturing-quality-tool/
 │   ├── equipment_tools.py      # 设备台账 + 传感器 + 故障知识库取数
 │   ├── work_order_tools.py     # create_work_order() 维修工单（S3-A-03）
 │   ├── planning_tools.py       # generate_production_plan() 生产计划（S5-A-02）
+│   ├── cost_tools.py           # 成本分析工具（S6-A-03，包装 modules/cost_model.py）
 │   └── quality_tools.py        # 质量取数（包装原有质量分析）
 │
 ├── agents/                     # Agent 层
@@ -74,8 +78,9 @@ manufacturing-quality-tool/
 ├── knowledge/                  # 原 RAG 知识库（知识卡 + 原始 PDF，保持原样）
 │   ├── equipment/              # 设备故障案例库（24 条，S3-A-01）
 │   └── quality/                # 质量改善案例库（24 条 / 4 类，S4-A-03）
+├── reports/                    # 制造决策报告（S6-A-04，含 README 与示例报告）
 ├── sample_data/                # 原多场景演示数据（铸造/焊接/磨削/车削等，保持原样）
-├── tests/                      # 回归 + 运营中心 + Agent + 设备诊断 + 质量议题测试
+├── tests/                      # 回归 + 运营中心 + Agent + 设备诊断 + 质量 + 排产 + 决策测试
 ├── requirements.txt
 ├── run_app.bat
 └── README.md
@@ -203,6 +208,7 @@ data/*.csv
 | `quality` | 质量 | `quality_agent` | `agent_tools.quality_tools` |
 | `quality_issue_analysis` | 质量议题 | `quality_agent` | `agent_tools.quality_tools` + `tools/traceability_tool.py` |
 | `production_planning` | 生产计划 | `planning_agent` | `agent_tools.planning_tools`（-> `modules/planning_engine.py`） |
+| `decision_fusion` | 决策融合 | `decision_engine` | `modules/decision_engine.py` + `agent_tools/cost_tools.py` |
 | `equipment_failure` | 设备故障 | `equipment_agent` | `agent_tools.equipment_tools` + `agent_tools.work_order_tools` |
 
 说明：`CAPABILITY_ORDER`（五维：订单/库存/生产/设备/质量）用于「综合风险」与「运营总览」；
@@ -225,6 +231,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
 | `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
 | `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉，或**「质量域词 + 趋势词」组合**（良率下降、合格率下滑、尺寸异常） | 质量议题（趋势 + 追溯 + 改善建议） |
+| `manufacturing_optimization` | 优化生产方案、优化方案、优化排产、**交付压力**、制造决策、决策报告、帮我优化 | **多 Agent 协同**：订单+生产计划+设备+质量+决策融合 |
 | `production_planning` | 生产计划、生产方案、**排产**、怎么安排生产、如何安排生产、交付计划 | 生产计划（排产 + 风险 + 建议） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
@@ -607,13 +614,89 @@ risk: medium        verdict: 持平（缺陷率 4.000% → 3.996%，环比 -0.1%
 `test_no_llm_switch_forces_rules_even_with_key`、
 `test_llm_planner_without_key_never_calls_client`。
 
+## 制造运营优化决策（Sprint 6）
+
+一句话触发 5 个 Agent 协同，输出可执行的制造决策报告。
+
+```bat
+python -m agents.supervisor_agent "最近订单交付压力大，帮我优化生产方案"
+python -m agents.supervisor_agent "10000件电机壳体，15天交付，帮我优化生产方案"
+python -m agents.supervisor_agent --no-report "最近订单交付压力大，帮我优化生产方案"
+```
+
+### 1）多 Agent 协同（S6-A-01）
+
+`manufacturing_optimization` 任务类型的执行计划（`--plan-only` 实测）：
+
+```text
+1. [订单]     order_agent      -> analyze_orders_overview
+2. [生产计划] planning_agent   -> generate_production_plan
+3. [设备]     equipment_agent  -> analyze_equipment_status
+4. [质量]     quality_agent    -> analyze_quality
+5. [决策融合] decision_engine  -> build_decision（依赖步骤 1、2、3、4）
+```
+
+前四步各自产出风险结论，第 5 步把它们与排产方案融合成综合建议。
+风险报告因此固定包含五段：订单交付 / 生产计划 / 设备 / 质量 / 综合决策。
+
+### 2）决策融合与成本比较（S6-A-02 / S6-A-03）
+
+候选措施按固定顺序**逐项累加**评估，每项节省 = 上一场景总工期 − 加入该措施后的工期：
+
+| 措施 | 工期影响 | 成本口径 |
+| --- | --- | --- |
+| 加急采购 | 备料 3 天 → 1 天 | 缺口金额 × 加急费率 8% |
+| 启用替代/并行设备 | 瓶颈产能 800 → 1650 件/天 | 换线调试 3,000 元/台 |
+| 增加班次 | 各工序产能 +30% | 工序数 × 生产工期 × 1,000 元/工序·天 |
+| —— | —— | 延期损失 12,000（违约金）+ 25,000（间接）/天 |
+
+费率集中在 [cost_model.py](manufacturing-quality-tool/modules/cost_model.py)，可按实际财务口径调整。
+
+### 3）制造决策报告（S6-A-04，`reports/`）
+
+文件名 `manufacturing_decision_<订单或产品>_<YYYYMMDD>.md`，重复运行**覆盖**同名文件。
+示例报告见 [reports/](manufacturing-quality-tool/reports)；紧张场景实测（节选）：
+
+```text
+订单：电机壳体 / 10000 件 / 2026-10-26 交付 / 优先级 normal
+
+一、当前方案
+  计划工期 17 天（采购备料 3 天 + 生产 14 天）｜交期剩余 15 天｜❌ 无法满足交期（超出 2 天）
+  排产明细：Day1-3 采购备料 / Day4-13 铸造 / Day5-17 CNC加工 / Day6-12 装配 / Day7-11 检测
+
+二、风险
+  订单交付 中 ｜ 质量 高 ｜ 设备 高 ｜ 生产计划 高 ｜ 综合 高
+
+三、优化方案
+  1. 加急采购（铝合金，3 天 → 1 天）        节省 2 天 → 累计 15 天   35,200 元
+  2. 启用 CNC加工 并行设备（CNC03）          节省 4 天 → 累计 11 天    3,000 元
+  3. 关键工序增加班次（产能 +30%）           节省 2 天 → 累计 9 天    32,000 元
+
+四、预计
+  优化后工期 9 天（节省 8 天，可满足交期）｜成本增加 70,200 元
+  收益：避免延期 2 天，避免延期损失 74,000 元｜净收益 3,800 元
+
+五、综合建议
+  建议执行：原计划 17 天超出交期 15 天（缺口 2 天）；执行 3 项措施后总工期 9 天
+```
+
+两个场景的决策结论由数据决定，系统不会为迎合"交付压力大"而编造延期：
+
+| 输入 | 基线 | 结论 |
+| --- | --- | --- |
+| `10000件电机壳体，15天交付，帮我优化生产方案` | 17 天 > 交期 15 天 | `execute` 建议执行（净收益 +3,800 元） |
+| `最近订单交付压力大，帮我优化生产方案` | 自动选最紧张订单 O001：15 天 ≤ 交期 21 天 | `keep_plan` 按原计划执行，措施标为「可选优化」 |
+
+推荐结论共有四种：`execute`（建议执行）、`trade_off`（成本高于延期损失，需权衡）、
+`escalate`（优化后仍超期，需外协/协商交期）、`keep_plan`（原计划可行，无需优化）。
+
 ## 测试与验收
 
 ```bat
 python -m pytest tests -q
 ```
 
-当前结果：**219 passed**。
+当前结果：**241 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -624,6 +707,7 @@ python -m pytest tests -q
 | `tests/test_quality_issue.py` | S4-A：质量改善知识库（≥20 条 / 4 类）、质量追溯链路、议题趋势与改善建议、Supervisor 质量议题路由 |
 | `tests/test_quality_mapping.py` | S4.1：良率下降等组合说法的意图优先级、产品映射层、追溯映射字段、质量异常→订单交付风险 |
 | `tests/test_production_planning.py` | S5-A：四条排产规则、故障设备替换、物料缺口、日级方案、Planning Agent 取数来源、Supervisor 排产路由 |
+| `tests/test_manufacturing_supervisor.py` | S6-A：成本模型、决策融合（措施累计节省/成本/收益）、多 Agent 协同任务与依赖、决策报告结构/命名/覆盖 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat
