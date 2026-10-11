@@ -68,7 +68,7 @@ git push -u origin main
 在应用页面 → **Settings → Secrets**，填入：
 
 ```toml
-DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxx"
+DEEPSEEK_API_KEY = "这里填你的 DeepSeek API Key"
 ```
 
 应用启动时会自动把该 Secret 桥接到环境变量（`app.py` 中的 `_bridge_streamlit_secrets()`），
