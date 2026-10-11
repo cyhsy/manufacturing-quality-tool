@@ -231,7 +231,7 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
 | `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
 | `equipment_failure` | 报警、告警、故障、停机、异常、诊断、维修 + **具体设备编号** | 设备故障（单台设备诊断 + 维修工单） |
 | `quality_issue_analysis` | 质量下降、质量变差、质量趋势、不良上升、缺陷率、客诉，或**「质量域词 + 趋势词」组合**（良率下降、合格率下滑、尺寸异常） | 质量议题（趋势 + 追溯 + 改善建议） |
-| `manufacturing_optimization` | 优化生产方案、优化方案、优化排产、**交付压力**、制造决策、决策报告、帮我优化 | **多 Agent 协同**：订单+生产计划+设备+质量+决策融合 |
+| `manufacturing_optimization` | ①字面：优化生产方案、优化方案、优化排产、**交付压力**、制造决策、决策报告、帮我优化；②目标识别：**问题/风险 + 解决动作**（见 6.1 节） | **多 Agent 协同**：订单+生产计划+设备+质量+决策融合 |
 | `production_planning` | 生产计划、生产方案、**排产**、怎么安排生产、如何安排生产、交付计划 | 生产计划（排产 + 风险 + 建议） |
 | `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
 | 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
@@ -254,6 +254,51 @@ Supervisor 不是「关键词直连工具」，而是先判定意图、再决定
   没有订单编号时按用户给出的产品、数量、交期单独测算，并与在手订单做交叉引用。
 - **设备编号与订单编号分离**：订单号只保留台账中真实存在的 `O001` 形式，
   设备号按 `[A-Z]{2,}\d{2,}` 与设备台账比对（`CNC02` 不会被误判成订单号）。
+
+### 意图优先级模型（Sprint 6.1）
+
+**问题**：此前「第一个命中的规则胜出」，规则书写顺序决定结果。
+`O001订单交付风险高，帮我制定优化方案` 命中「风险」后被 `comprehensive_risk` 抢先，
+而用户真正要的是**解决**风险而不是**分析**风险。
+
+**修复**：把「哪些意图命中」与「哪个意图胜出」解耦（两阶段模型）。
+
+```text
+classify(text, entities)
+  ├── collect_intent_candidates()   收集所有命中：意图规则 + 用户目标识别 + 实体兜底 + 关键词细分
+  └── select_intent()               按意图优先级选出唯一意图
+```
+
+| 概念 | 内容 |
+| --- | --- |
+| `ACTION_INTENTS` | 动作型（解决问题）：manufacturing_optimization、production_planning、quality_issue_analysis、equipment_failure |
+| `INTENT_PRIORITY` | 完整优先级表；**动作型一律优先于分析型**，同类型内按表顺序 |
+| `_intent_rank()` | 排序键 `(是否动作型, 优先级序号)`，`min()` 取胜者 |
+| `is_problem_and_resolution()` | 用户目标识别：`PROBLEM_SIGNALS`（风险/问题/延期/短缺/压力/下降/缺陷…）**且** `OPTIMIZATION_SIGNALS`（优化/改善/调整方案/怎么解决/怎么办/制定方案/降低…） |
+
+用户目标对照（PM 裁定表，均有测试锁定）：
+
+| 用户说 | 意图 |
+| --- | --- |
+| 订单有什么风险？ | `comprehensive_risk`（风险**分析**） |
+| **O001订单交付风险高，帮我制定优化方案** | **`manufacturing_optimization`（优化决策）** |
+| 订单风险高怎么办？ | `manufacturing_optimization` |
+| 如何降低延期风险 | `manufacturing_optimization` |
+| 质量风险高，怎么改善？ | `manufacturing_optimization` |
+| 分析订单风险 | `comprehensive_risk` |
+| 订单能否按时完成 | `order_delivery` |
+| 制定生产计划 | `production_planning` |
+| 优化生产方案 | `manufacturing_optimization` |
+
+设计约束（避免「修一个冒一个」）：
+
+- **设备类词不进入问题信号**：`故障 / 停机 / 报警` 刻意不在 `PROBLEM_SIGNALS` 中，
+  因此 `CNC02故障停机，怎么解决` 仍走 `equipment_failure`（给出诊断 + 维修工单），
+  不会被优化决策抢走。
+- **优先级表必须覆盖全部意图编码**：漏掉任一编码会让它掉到默认最低优先级，
+  从而被同层级的兜底意图抢走 —— S6.1 修复过程中 `order_delivery` 就被 `order_query`
+  抢走过一次，因此新增结构测试 `test_intent_priority_covers_every_intent_code`
+  （断言 `set(INTENT_PRIORITY) == set(INTENT_LABELS)`）锁死该约束。
 
 ### 执行计划示例
 
@@ -690,13 +735,41 @@ python -m agents.supervisor_agent --no-report "最近订单交付压力大，帮
 推荐结论共有四种：`execute`（建议执行）、`trade_off`（成本高于延期损失，需权衡）、
 `escalate`（优化后仍超期，需外协/协商交期）、`keep_plan`（原计划可行，无需优化）。
 
+## 已知技术债：一次任务的数据重复读取（S6.1-A-04 检查结论）
+
+**结论：确认存在重复调用，但不影响正确性；按裁定放到 Sprint 7 用 `context_cache` 统一治理。**
+
+实测方式：在导入 Agent 之前包装 `pandas.read_csv` 计数，跑一次完整优化任务
+（`10000件电机壳体，15天交付，帮我优化生产方案`）：
+
+| 数据文件 | 读取次数 | 主要重复来源 |
+| --- | --- | --- |
+| `quality.csv` | 11 | 实体识别分别调用 `list_part_names` / `list_defect_types` / `list_processes`（各读一次）；质量总览与缺陷统计各自再读 |
+| `equipment.csv` | 10 | `evaluate_delivery` 内部读 2 次；`equipment_agent` 的汇总 / 异常清单 / 传感器各读一次 |
+| `production.csv` | 7 | 产品识别、工序识别、`get_production_lines`、排产各读一次 |
+| `inventory.csv` | 6 | `get_shortage_list` / `get_inventory_summary` / 物料需求各读一次 |
+| `iot_sensor.csv` | 6 | 传感器告警按设备逐次读取 |
+| `orders.csv` | 4 | 实体识别、订单总览、单订单分析各读一次 |
+| `bom.csv` | 1 | —— |
+| **合计** | **45** | 单个任务 7 个文件 45 次读取 |
+
+**Sprint 7 计划（`context_cache`）**：
+
+1. 任务级缓存：`read_data_csv(file_name)` 在一次 `handle()` 内只读一次，
+   由 Supervisor 在任务开始时建立、结束时释放（`contextvars` 或显式上下文对象传入）；
+2. 结果级共享：同一轮协同中，`order_agent` / `planning_agent` / `decision_engine`
+   共享已取到的订单、产能、设备、质量结果，避免「Planning Agent 内取一次、
+   Supervisor 再取一次」的重复调用；
+3. 验收标准：上述表格**每个文件降到 1 次读取**，并保留 `test_data_reads_per_optimization_task_are_bounded`
+   作为不恶化 Guard（当前阈值：单文件 ≤ 15 次、合计 ≤ 60 次）。
+
 ## 测试与验收
 
 ```bat
 python -m pytest tests -q
 ```
 
-当前结果：**241 passed**。
+当前结果：**265 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
@@ -708,6 +781,7 @@ python -m pytest tests -q
 | `tests/test_quality_mapping.py` | S4.1：良率下降等组合说法的意图优先级、产品映射层、追溯映射字段、质量异常→订单交付风险 |
 | `tests/test_production_planning.py` | S5-A：四条排产规则、故障设备替换、物料缺口、日级方案、Planning Agent 取数来源、Supervisor 排产路由 |
 | `tests/test_manufacturing_supervisor.py` | S6-A：成本模型、决策融合（措施累计节省/成本/收益）、多 Agent 协同任务与依赖、决策报告结构/命名/覆盖 |
+| `tests/test_intent_priority.py` | S6.1：验收原文路由、优先级表完整性、动作型>分析型、问题+解决动作识别、全量路由矩阵、重复读取 Guard |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat

@@ -539,65 +539,197 @@ def _rule_matches(rule, lowered_text):
     return False
 
 
-def classify(text, entities):
-    """输入 + 实体 -> (意图编码, 意图名称, 能力列表, 判定理由)。"""
-    lowered = str(text).lower()
+# --------------------------------------------------------------------------
+# 意图优先级模型（S6.1-A-01 / S6.1-A-02）
+# --------------------------------------------------------------------------
 
+# 动作型意图：用户要「解决问题」（优化 / 排产 / 改善 / 诊断）
+ACTION_INTENTS = (
+    "manufacturing_optimization",
+    "production_planning",
+    "quality_issue_analysis",
+    "equipment_failure",
+)
+
+# 意图优先级：动作型优先于分析型；同类型内按此顺序。
+# 「哪些意图命中」由 collect_intent_candidates 判断，
+# 「哪个意图胜出」由 _intent_rank 依此顺序决定，避免规则书写顺序影响结果。
+#
+# 注意：这里必须覆盖**全部**意图编码 —— 漏掉某个编码会让它掉到默认最低优先级，
+# 从而被同层级的兜底意图（如 order_query）抢走（S6.1 修复过程中出现过该问题）。
+INTENT_PRIORITY = [
+    # 动作型：解决问题
+    "manufacturing_optimization",
+    "production_planning",
+    "quality_issue_analysis",
+    "equipment_failure",
+    # 分析型：判断、汇总与查询
+    "comprehensive_risk",
+    "order_delivery",
+    "overview",
+    "equipment_query",
+    "quality_query",
+    "order_query",
+    "inventory_query",
+    "production_query",
+    "mixed_query",
+]
+
+# 用户目标识别（S6.1-A-02）：问题/风险 + 解决动作 -> 优化决策
+OPTIMIZATION_SIGNALS = (
+    "优化",
+    "改善",
+    "调整方案",
+    "怎么解决",
+    "怎么办",
+    "制定方案",
+    "降低风险",
+    "提高效率",
+    "降低",
+)
+PROBLEM_SIGNALS = (
+    "风险",
+    "问题",
+    "延期",
+    "超期",
+    "冲突",
+    "短缺",
+    "不足",
+    "缺口",
+    "压力",
+    "下降",
+    "恶化",
+    "瓶颈",
+    "积压",
+    "缺陷",
+    "不良",
+    "返工",
+    "报废",
+)
+
+
+def is_problem_and_resolution(text):
+    """用户目标识别：是否在「针对问题要求解决方案」（而不是分析问题）。
+
+    注意：设备类词（故障 / 停机 / 报警）刻意不在此列表中 ——
+    这类诉求由设备故障诊断意图处理（它会给出诊断与维修工单），
+    不会被优化决策抢走。
+    """
+    content = str(text)
+    has_problem = any(signal in content for signal in PROBLEM_SIGNALS)
+    has_resolution = any(signal in content for signal in OPTIMIZATION_SIGNALS)
+    return has_problem and has_resolution
+
+
+def _intent_rank(intent_code):
+    """排序键：动作型意图优先，其次按 ``INTENT_PRIORITY`` 顺序。"""
+    kind_rank = 0 if intent_code in ACTION_INTENTS else 1
+    priority_rank = (
+        INTENT_PRIORITY.index(intent_code)
+        if intent_code in INTENT_PRIORITY
+        else len(INTENT_PRIORITY)
+    )
+    return (kind_rank, priority_rank)
+
+
+def collect_intent_candidates(text, entities):
+    """收集所有命中的意图候选（只判断是否命中，不决定胜负）。"""
+    lowered = str(text).lower()
+    candidates = {}
+
+    def add(code, capabilities, reason):
+        if code not in candidates:
+            candidates[code] = {
+                "label": _label_for(code),
+                "capabilities": list(capabilities),
+                "reason": reason,
+            }
+
+    # 1）意图规则：字面关键词 / 组合条件（keyword_groups）/ 实体约束
     for rule in INTENT_RULES:
         if not _rule_matches(rule, lowered):
             continue
         required_entity = rule.get("requires_entity")
         if required_entity and not entities.get(required_entity):
             continue
-        return rule["code"], _label_for(rule["code"]), list(rule["capabilities"]), rule["reason"]
+        add(rule["code"], rule["capabilities"], rule["reason"])
 
-    # 无风险/交付关键词，但给出了订单号或「产品 + 数量」：按交付能力分析处理
+    # 2）用户目标识别：问题/风险 + 解决动作 -> 优化决策
+    if is_problem_and_resolution(text):
+        add(
+            MANUFACTURING_OPTIMIZATION_TASK,
+            MANUFACTURING_OPTIMIZATION_CHAIN,
+            "用户针对问题要求解决方案（问题/风险 + 解决动作），按多 Agent 协同优化处理",
+        )
+
+    # 3）实体兜底：只给出订单 / 设备 / 质量侧实体时
     if entities.get("order_ids") or (
         entities.get("product") and entities.get("quantity")
     ):
-        return (
+        add(
             "order_delivery",
-            _label_for("order_delivery"),
-            list(DELIVERY_CAPABILITIES),
+            DELIVERY_CAPABILITIES,
             "用户给出了具体订单实体，按交付能力分析处理",
         )
-
-    # 只给出设备编号：按单台设备故障诊断处理
     if entities.get("equipment_ids"):
-        return (
+        add(
             "equipment_failure",
-            _label_for("equipment_failure"),
             ["equipment_failure"],
             f"用户指向具体设备 {entities['equipment_ids'][0]}，按设备故障诊断处理",
         )
-
-    # 只给出质量侧实体（零件 / 缺陷类型 / 批次）：按质量议题分析处理
     if entities.get("part_name") or entities.get("defect_type") or entities.get("batch"):
-        return (
+        add(
             "quality_issue_analysis",
-            _label_for("quality_issue_analysis"),
             ["quality_issue_analysis"],
             "用户给出了质量侧实体（零件 / 缺陷类型 / 批次），按质量议题分析处理",
         )
 
+    # 4）关键词细分兜底
     matched = detect_capabilities(text)
     if len(matched) == 1:
         code = f"{matched[0]}_query"
-        return code, _label_for(code), matched, f"用户只关注{CAPABILITIES[matched[0]]['label']}维度"
-    if len(matched) > 1:
-        return (
+        add(code, matched, f"用户只关注{CAPABILITIES[matched[0]]['label']}维度")
+    elif len(matched) > 1:
+        add(
             "mixed_query",
-            _label_for("mixed_query"),
             matched,
             "用户同时关注多个维度：" + "、".join(CAPABILITIES[item]["label"] for item in matched),
         )
+    else:
+        add("overview", CAPABILITY_ORDER, "未识别出具体诉求，返回制造运营总览")
 
-    return (
-        "overview",
-        _label_for("overview"),
-        list(CAPABILITY_ORDER),
-        "未识别出具体诉求，返回制造运营总览",
-    )
+    return candidates
+
+
+def select_intent(candidates):
+    """按「动作型 > 分析型 + INTENT_PRIORITY」选出最终意图。"""
+    if not candidates:
+        return (
+            "overview",
+            _label_for("overview"),
+            list(CAPABILITY_ORDER),
+            "未识别出具体诉求，返回制造运营总览",
+        )
+
+    code = min(candidates, key=_intent_rank)
+    entry = candidates[code]
+    return code, entry["label"], entry["capabilities"], entry["reason"]
+
+
+def classify(text, entities):
+    """输入 + 实体 -> (意图编码, 意图名称, 能力列表, 判定理由)。
+
+    两阶段模型：
+
+    1. ``collect_intent_candidates`` 收集**所有**命中意图（含关键词、组合条件、
+       实体兜底与用户目标识别）；
+    2. ``select_intent`` 按意图优先级选出最终意图（动作型 > 分析型）。
+
+    这样「哪些意图命中」与「哪个意图胜出」解耦：
+    「O001订单交付风险高，帮我制定优化方案」同时命中风险分析与优化决策，
+    因优化是动作型意图而胜出 —— 用户要的是解决风险，不是分析风险。
+    """
+    return select_intent(collect_intent_candidates(text, entities))
 
 
 def _action_for(capability, entities):
