@@ -134,6 +134,16 @@ def test_query_orders_returns_all_rows_and_filters():
     assert query_orders(customer="不存在的客户").empty
 
 
+def test_query_orders_supports_order_id_filter():
+    single = query_orders(order_id="O001")
+    assert list(single["order_id"]) == ["O001"]
+    assert int(single.iloc[0]["quantity"]) == 10000
+
+    assert list(query_orders(order_id="o001")["order_id"]) == ["O001"]
+    assert sorted(query_orders(order_id=["O001", "O002"])["order_id"]) == ["O001", "O002"]
+    assert query_orders(order_id="O999").empty
+
+
 def test_query_inventory_returns_stock_and_shortage_subset():
     inventory = query_inventory()
     assert len(inventory) == 13

@@ -26,6 +26,12 @@ from modules.defect_analysis import (
     summarize_by_dimension,
 )
 from modules.demo_data import list_sample_files, load_sample_upload
+from modules.inventory_analysis import (
+    INVENTORY_GAP_COLUMN,
+    INVENTORY_STATUS_COLUMN,
+    build_inventory_status,
+    get_shortage_materials,
+)
 from modules.llm_quality_analysis import (
     DeepSeekAnalysisError,
     generate_deepseek_quality_analysis,
@@ -485,37 +491,21 @@ def show_deepseek_quality_analysis(df, dataset_signature):
 # =============================================================================
 
 
-def build_inventory_status(inventory_df):
-    """为库存数据补充「库存状态」与「缺口」两列。
-
-    库存口径：stock < safety_stock 记为「预警」，
-    缺口 = safety_stock - stock（仅保留不足部分，充足时为 0）。
-    """
-    if inventory_df.empty:
-        return inventory_df.copy()
-
-    df = inventory_df.copy()
-    stock = pd.to_numeric(df["stock"], errors="coerce").fillna(0)
-    safety_stock = pd.to_numeric(df["safety_stock"], errors="coerce").fillna(0)
-
-    df["缺口"] = (safety_stock - stock).clip(lower=0).astype("int64")
-    df["库存状态"] = "正常"
-    df.loc[stock < safety_stock, "库存状态"] = "预警"
-    return df
-
-
 def to_inventory_display_frame(inventory_df):
-    """库存展示表：中文表头 + 库存状态 + 缺口。"""
+    """库存展示表：中文表头 + 库存状态 + 缺口。
+
+    库存状态与缺口口径来自 modules/inventory_analysis.py（全项目唯一来源）。
+    """
     display = inventory_df.rename(
         columns={
             "material": "物料",
             "stock": "当前库存",
             "safety_stock": "安全库存",
             "unit": "单位",
-            "库存状态": "状态",
+            INVENTORY_STATUS_COLUMN: "状态",
         }
     )
-    columns = ["物料", "当前库存", "安全库存", "单位", "状态", "缺口"]
+    columns = ["物料", "当前库存", "安全库存", "单位", "状态", INVENTORY_GAP_COLUMN]
     return display[[column for column in columns if column in display.columns]]
 
 
@@ -542,7 +532,7 @@ def show_manufacturing_overview():
     )
 
     material_count = int(len(inventory_df))
-    shortage_df = inventory_df.loc[inventory_df["库存状态"] == "预警"]
+    shortage_df = get_shortage_materials(inventory_df)
     shortage_count = int(len(shortage_df))
 
     # ---------- 顶部关键指标 ----------
