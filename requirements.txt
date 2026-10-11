@@ -1,0 +1,11 @@
+streamlit
+pandas
+openpyxl
+plotly
+matplotlib
+pytest
+ruff
+python-docx
+kaleido
+openai
+pydantic
