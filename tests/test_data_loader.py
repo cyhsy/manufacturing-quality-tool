@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.data_loader import REQUIRED_COLUMNS, validate_required_columns
+from modules.quality_analysis import REQUIRED_COLUMNS, validate_required_columns
 
 
 def test_validate_required_columns_returns_empty_list_when_complete():

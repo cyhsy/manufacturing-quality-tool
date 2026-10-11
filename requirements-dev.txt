@@ -1,0 +1,5 @@
+# 开发/测试依赖（部署到 Streamlit Community Cloud 不需要，云端只安装 requirements.txt）
+-r requirements.txt
+
+pytest
+ruff

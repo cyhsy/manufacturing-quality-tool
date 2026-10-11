@@ -1,10 +1,7 @@
 streamlit
 pandas
-openpyxl
 plotly
-matplotlib
-pytest
-ruff
+openpyxl
 python-docx
 kaleido
 openai

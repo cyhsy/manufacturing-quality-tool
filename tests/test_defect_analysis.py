@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from src.defect_analysis import (
+from modules.defect_analysis import (
     filter_records_by_date,
     generate_quality_summary,
     get_top_defect_date,

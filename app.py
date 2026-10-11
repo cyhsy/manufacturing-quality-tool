@@ -5,15 +5,15 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from src.charts import (
+from modules import equipment_analysis, order_analysis, production_analysis
+from modules.charts import (
     create_control_chart,
     create_date_trend_chart,
     create_histogram,
     create_pareto_chart,
     create_root_cause_pareto_chart,
 )
-from src.data_loader import load_quality_file, validate_required_columns
-from src.defect_analysis import (
+from modules.defect_analysis import (
     DATE_COLUMN,
     DEFECT_COUNT_COLUMN,
     filter_records_by_date,
@@ -25,20 +25,36 @@ from src.defect_analysis import (
     summarize_by_defect_type,
     summarize_by_dimension,
 )
-from src.demo_data import list_sample_files, load_sample_upload
-from src.llm_quality_analysis import (
+from modules.demo_data import list_sample_files, load_sample_upload
+from modules.inventory_analysis import (
+    INVENTORY_GAP_COLUMN,
+    INVENTORY_STATUS_COLUMN,
+    build_inventory_status,
+    get_shortage_materials,
+)
+from modules.llm_quality_analysis import (
     DeepSeekAnalysisError,
     generate_deepseek_quality_analysis,
 )
-from src.report_generator import build_excel_report
-from src.root_cause_engine import (
+from modules.quality_analysis import (
+    analyze_quality_overview,
+    load_quality_file,
+    validate_required_columns,
+)
+from modules.report_generator import build_excel_report
+from modules.root_cause_engine import (
     find_defect_root_causes,
     get_all_process_types,
     get_defect_types_for_process,
     get_root_causes,
     probability_to_level,
 )
-from src.word_report_generator import build_word_report
+from modules.word_report_generator import build_word_report
+from tools import read_data_csv
+from tools.equipment_tool import query_equipment_status
+from tools.inventory_tool import query_inventory
+from tools.order_tool import query_orders
+from tools.production_tool import query_production_capacity
 
 
 def _style_df(df, percent_cols=None):
@@ -470,153 +486,480 @@ def show_deepseek_quality_analysis(df, dataset_signature):
         st.write(f"总 Tokens：{format_tokens('total_tokens')}")
 
 
+# =============================================================================
+# A-07 制造运营中心（工厂驾驶舱）
+# =============================================================================
+
+
+def to_inventory_display_frame(inventory_df):
+    """库存展示表：中文表头 + 库存状态 + 缺口。
+
+    库存状态与缺口口径来自 modules/inventory_analysis.py（全项目唯一来源）。
+    """
+    display = inventory_df.rename(
+        columns={
+            "material": "物料",
+            "stock": "当前库存",
+            "safety_stock": "安全库存",
+            "unit": "单位",
+            INVENTORY_STATUS_COLUMN: "状态",
+        }
+    )
+    columns = ["物料", "当前库存", "安全库存", "单位", "状态", INVENTORY_GAP_COLUMN]
+    return display[[column for column in columns if column in display.columns]]
+
+
+def show_manufacturing_overview():
+    """制造运营中心（工厂驾驶舱）：订单 / 库存 / 设备 / 质量 四个模块。"""
+    st.subheader("🏭 制造运营中心")
+    st.caption(
+        "工厂驾驶舱总览。数据来自 data/ 目录下的 ERP 订单、原材料库存、设备台账、"
+        "MES 生产、设备传感器与质量数据，均为模拟数据。"
+    )
+
+    orders_df = query_orders()
+    inventory_df = build_inventory_status(query_inventory())
+    equipment_df = query_equipment_status()
+    production_df = query_production_capacity()
+
+    order_summary = order_analysis.summarize_orders(orders_df)
+    equipment_summary = equipment_analysis.summarize_equipment(equipment_df)
+    production_summary = production_analysis.summarize_production(production_df)
+    quality_overview = analyze_quality_overview()
+    capacity = production_analysis.calculate_capacity_vs_demand(
+        orders_df=orders_df,
+        production_df=production_df,
+    )
+
+    material_count = int(len(inventory_df))
+    shortage_df = get_shortage_materials(inventory_df)
+    shortage_count = int(len(shortage_df))
+
+    # ---------- 顶部关键指标 ----------
+    metric_orders, metric_inventory, metric_equipment, metric_quality = st.columns(4)
+
+    with metric_orders:
+        st.metric(
+            "在手订单",
+            f"{order_summary['order_count']} 单",
+            f"合计 {order_summary['total_quantity']} 件",
+            delta_color="off",
+        )
+    with metric_inventory:
+        st.metric(
+            "原材料状态",
+            f"{material_count - shortage_count} 项正常",
+            f"{shortage_count} 项低于安全库存" if shortage_count else "无库存预警",
+            delta_color="off",
+        )
+    with metric_equipment:
+        st.metric(
+            "设备正常 / 异常",
+            f"{equipment_summary['normal_count']} / {equipment_summary['abnormal_count']}",
+            f"设备正常率 {equipment_summary['normal_ratio']:.1%}",
+            delta_color="off",
+        )
+    with metric_quality:
+        st.metric(
+            "质量缺陷总数",
+            f"{quality_overview['total_defect_count']}",
+            f"涉及 {quality_overview['defect_type_count']} 类缺陷",
+            delta_color="off",
+        )
+
+    # ---------- 风险提示 ----------
+    alerts = []
+    if shortage_count:
+        alerts.append(f"{shortage_count} 项原材料低于安全库存")
+    if equipment_summary["abnormal_count"]:
+        alerts.append(
+            f"{equipment_summary['abnormal_count']} 台设备处于异常状态"
+            f"（其中故障 {equipment_summary['fault_count']} 台）"
+        )
+    if capacity["capacity_risk"]:
+        alerts.append("在手订单所需生产天数已超过最早交期可用天数")
+    if alerts:
+        st.warning("风险提示：" + "；".join(alerts) + "。")
+
+    order_column, inventory_column = st.columns(2)
+
+    # ---------- 模块 1：订单 ----------
+    with order_column:
+        with st.container(border=True):
+            st.markdown("#### 📋 订单")
+            st.caption("ERP 模拟订单数据（data/orders.csv）")
+            st.write(
+                f"当前订单数量：**{order_summary['order_count']} 单**，"
+                f"合计 **{order_summary['total_quantity']} 件**，"
+                f"高优先级 **{order_summary['high_priority_count']} 单**，"
+                f"覆盖 **{order_summary['customer_count']} 家客户**。"
+            )
+
+            st.markdown("**订单优先级分布**")
+            st.dataframe(
+                _style_df(order_analysis.get_priority_breakdown(orders_df), ["占比"]),
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.markdown("**最近交付订单**")
+            st.dataframe(
+                order_analysis.to_display_frame(
+                    order_analysis.get_urgent_orders(orders_df, limit=5)
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+            if capacity["required_days"] is not None:
+                st.caption(
+                    f"产能测算：按在产日产能 {capacity['daily_capacity']} 件，"
+                    f"完成在手订单约需 {capacity['required_days']} 天；"
+                    f"最早交期 {capacity['earliest_deadline']}"
+                    f"（距今 {capacity['available_days']} 天）。"
+                )
+
+            for line in order_analysis.order_insights(orders_df):
+                st.caption(f"· {line}")
+
+    # ---------- 模块 2：库存 ----------
+    with inventory_column:
+        with st.container(border=True):
+            st.markdown("#### 📦 库存")
+            st.caption("原材料库存数据（data/inventory.csv）")
+            st.write(
+                f"原材料 **{material_count} 项**，"
+                f"其中低于安全库存 **{shortage_count} 项**。"
+            )
+
+            if shortage_df.empty:
+                st.success("所有原材料库存均在安全库存之上。")
+            else:
+                st.markdown("**库存预警物料**")
+                st.dataframe(
+                    to_inventory_display_frame(
+                        shortage_df.sort_values("缺口", ascending=False)
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with st.expander("查看全部原材料库存"):
+                st.dataframe(
+                    to_inventory_display_frame(inventory_df),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+    equipment_column, quality_column = st.columns(2)
+
+    # ---------- 模块 3：设备 ----------
+    with equipment_column:
+        with st.container(border=True):
+            st.markdown("#### ⚙️ 设备")
+            st.caption("设备台账数据（data/equipment.csv）")
+            st.write(
+                f"正常设备 **{equipment_summary['normal_count']} 台**，"
+                f"异常设备 **{equipment_summary['abnormal_count']} 台**"
+                f"（预警 {equipment_summary['warning_count']}、"
+                f"故障 {equipment_summary['fault_count']}）。"
+            )
+
+            st.dataframe(
+                _style_df(equipment_analysis.get_status_breakdown(equipment_df), ["占比"]),
+                width="stretch",
+                hide_index=True,
+            )
+
+            abnormal_df = equipment_analysis.get_abnormal_equipment(equipment_df)
+            if abnormal_df.empty:
+                st.success("当前没有异常设备。")
+            else:
+                st.markdown("**异常设备清单**")
+                st.dataframe(
+                    equipment_analysis.to_display_frame(abnormal_df),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            maintenance_due = equipment_analysis.get_maintenance_due(equipment_df)
+            if not maintenance_due.empty:
+                st.warning(
+                    "维保超期设备："
+                    + "、".join(maintenance_due["equipment_id"].tolist())
+                )
+
+            sensor_df = read_data_csv("iot_sensor.csv")
+            with st.expander(f"设备传感器数据（共 {len(sensor_df)} 条）"):
+                st.caption(f"最新采集时间：{sensor_df['timestamp'].max()}")
+                st.dataframe(
+                    sensor_df.tail(6),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+    # ---------- 模块 4：质量（沿用原有质量分析） ----------
+    with quality_column:
+        with st.container(border=True):
+            st.markdown("#### ✅ 质量")
+            st.caption(
+                "沿用原有质量分析逻辑：modules/quality_analysis.py + data/quality.csv"
+            )
+
+            quality_metric_count, quality_metric_type = st.columns(2)
+            with quality_metric_count:
+                st.metric("总缺陷数量", quality_overview["total_defect_count"])
+            with quality_metric_type:
+                st.metric("缺陷类型数量", quality_overview["defect_type_count"])
+
+            if quality_overview["missing_columns"]:
+                st.warning(
+                    "质量数据缺少必要字段："
+                    + "、".join(quality_overview["missing_columns"])
+                )
+            else:
+                st.write(
+                    f"主要缺陷类型：**{quality_overview['top_defect_type']}**"
+                    f"（{quality_overview['top_defect_count']} 件）；"
+                    f"质量记录 {quality_overview['record_count']} 条。"
+                )
+
+                st.dataframe(
+                    _style_df(
+                        quality_overview["defect_summary"].head(6),
+                        ["占比"],
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                with st.expander("质量分析摘要（原规则摘要）"):
+                    for line in quality_overview["summary_lines"]:
+                        st.markdown(f"- {line}")
+
+            st.caption("帕雷托分析、根因分析、AI 分析与报告导出见「🔍 质量分析」标签页。")
+
+    # ---------- 生产能力明细（MES） ----------
+    with st.expander("生产能力明细（MES 生产数据 data/production.csv）"):
+        st.write(
+            f"MES 覆盖 **{production_summary['product_count']} 种产品**、"
+            f"**{production_summary['process_count']} 道工序**、"
+            f"**{production_summary['equipment_count']} 台设备**，"
+            f"共 {production_summary['line_count']} 条产线；"
+            f"总日产能 **{production_summary['total_daily_capacity']} 件**，"
+            f"在产日产能 **{production_summary['running_daily_capacity']} 件**，"
+            f"在产平均良率 **{production_summary['average_yield_rate']:.1%}**。"
+        )
+
+        st.markdown("**按工序汇总**")
+        st.dataframe(
+            _style_df(
+                production_analysis.get_process_breakdown(production_df),
+                ["平均良率"],
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.markdown("**产线明细**")
+        st.dataframe(
+            production_analysis.to_display_frame(production_df),
+            width="stretch",
+            hide_index=True,
+        )
+
+        for line in production_analysis.production_insights(
+            orders_df=orders_df,
+            production_df=production_df,
+        ):
+            st.caption(f"· {line}")
+
+
+def show_quality_analysis_page():
+    """原有质量分析页面：原 app.py 主体逻辑，保持不变，仅在 Tab 内渲染。"""
+    st.caption("打开页面即可使用内置示例数据完整演示；也可以切换为上传自己的文件。")
+
+    data_source = st.radio(
+        "数据来源",
+        ["内置示例数据", "上传自己的文件"],
+        horizontal=True,
+    )
+
+    if data_source == "内置示例数据":
+        sample_dir = Path(__file__).resolve().parent / "sample_data"
+        try:
+            sample_files = list_sample_files(sample_dir)
+            selected_sample_name = st.selectbox(
+                "选择演示数据",
+                [path.name for path in sample_files],
+                help="默认样例覆盖零件、工序、供应商、严重等级、日期趋势和报告导出。",
+            )
+            selected_sample_path = next(
+                path for path in sample_files if path.name == selected_sample_name
+            )
+            uploaded_file = load_sample_upload(selected_sample_path)
+            st.info(f"当前使用演示数据：{selected_sample_name}")
+        except (FileNotFoundError, OSError) as exc:
+            uploaded_file = None
+            st.error(f"示例数据加载失败：{exc}")
+    else:
+        uploaded_file = st.file_uploader(
+            "上传质量异常记录文件",
+            type=["csv", "xlsx", "xls"],
+        )
+
+    if uploaded_file is None:
+        if data_source == "上传自己的文件":
+            st.info("请上传 csv、xlsx 或 xls 文件。")
+    else:
+        try:
+            df = load_quality_file(uploaded_file)
+        except Exception as exc:
+            st.error(f"文件读取失败：{exc}")
+        else:
+            st.success("文件读取成功。")
+
+            row_count, column_count = df.shape
+            st.write(f"数据行数：{row_count}")
+            st.write(f"数据列数：{column_count}")
+
+            missing_columns = validate_required_columns(df)
+            if missing_columns:
+                st.warning("缺少必要字段：" + "、".join(missing_columns))
+            else:
+                st.success("必要字段检查通过。")
+
+                defect_summary = summarize_by_defect_type(df)
+                total_defect_count = defect_summary["缺陷数量"].sum()
+                defect_type_count = len(defect_summary)
+
+                st.subheader("缺陷类型统计")
+                st.write(f"总缺陷数量：{total_defect_count}")
+                st.write(f"缺陷类型数量：{defect_type_count}")
+                st.dataframe(_style_df(defect_summary, ["占比"]), width="stretch")
+
+                try:
+                    show_bidirectional_pareto(df)
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception as exc:
+                    st.error(f"帕雷托图生成失败：{exc}")
+
+                st.subheader("多维度问题定位")
+                part_tab, process_tab, supplier_tab, severity_tab, root_cause_tab = st.tabs(
+                    ["零件", "工序", "供应商", "严重等级", "根因分析"]
+                )
+                with part_tab:
+                    show_dimension_analysis(df, "零件名称", "零件")
+                with process_tab:
+                    show_dimension_analysis(df, "工序", "工序")
+                with supplier_tab:
+                    show_dimension_analysis(df, "供应商", "供应商")
+                with severity_tab:
+                    show_dimension_analysis(df, "严重等级", "严重等级")
+                with root_cause_tab:
+                    show_root_cause_analysis()
+
+                st.subheader("质量分析摘要")
+                try:
+                    quality_summary = generate_quality_summary(df)
+                    for item in quality_summary:
+                        st.markdown(f"- {item}")
+                except Exception as exc:
+                    st.error(f"质量分析摘要生成失败：{exc}")
+
+                dataset_signature = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+                show_deepseek_quality_analysis(df, dataset_signature)
+
+            show_date_trend_and_trace(df)
+
+            st.subheader("QC 统计图表")
+            qc_col1, qc_col2 = st.columns(2)
+
+            with qc_col1:
+                st.markdown("#### 缺陷数量直方图")
+                try:
+                    hist_fig = create_histogram(df)
+                    st.plotly_chart(hist_fig, width="stretch", key="qc_histogram", config={"displayModeBar": False})
+                except Exception as exc:
+                    st.warning(f"直方图生成失败：{exc}")
+
+            with qc_col2:
+                st.markdown("#### 每日缺陷控制图")
+                try:
+                    date_summary_for_ctrl = summarize_by_date(df)
+                    if date_summary_for_ctrl.empty:
+                        st.info("暂无可用于生成控制图的数据。")
+                    else:
+                        ctrl_fig = create_control_chart(date_summary_for_ctrl)
+                        st.plotly_chart(ctrl_fig, width="stretch", key="qc_control", config={"displayModeBar": False})
+                except Exception as exc:
+                    st.warning(f"控制图生成失败：{exc}")
+
+            st.subheader("导出分析报告")
+            col1, col2 = st.columns(2)
+            with col1:
+                try:
+                    report_bytes = build_excel_report(df)
+                    st.download_button(
+                        label="下载 Excel 分析报告",
+                        data=report_bytes,
+                        file_name="quality_analysis_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                except Exception as exc:
+                    st.error(f"Excel 报告生成失败：{exc}")
+            with col2:
+                try:
+                    word_bytes = build_word_report(df)
+                    st.download_button(
+                        label="下载 Word 8D 分析报告",
+                        data=word_bytes,
+                        file_name="8D_quality_report.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                except Exception as exc:
+                    st.error(f"Word 8D 报告生成失败：{exc}")
+
+
+# =============================================================================
+# 页面入口：制造运营中心（新增 Tab）+ 质量分析（原有页面，保持不变）
+# =============================================================================
+
 st.set_page_config(
     page_title="Manufacturing Quality Tool",
     layout="wide",
 )
 
+
+def _bridge_streamlit_secrets():
+    """把 Streamlit Cloud 的 Secrets 桥接到 os.environ。
+
+    本地运行时 ``DEEPSEEK_API_KEY`` 走环境变量；Streamlit Community Cloud 上
+    密钥存放在 Secrets（``st.secrets``），**不会**进入 ``os.environ``，
+    而 agents/ 与 modules/ 中的既有读取路径用的是 ``os.environ``。
+    这里做一次桥接，使云端与本地行为一致；未配置 Secrets 时静默跳过
+    （LLM 功能自动回退到规则模式）。
+    """
+    import os
+
+    try:
+        secrets = st.secrets
+        for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            if key in secrets and not os.environ.get(key):
+                os.environ[key] = str(secrets[key]).strip()
+    except Exception:  # 无 secrets.toml / 非 Streamlit 运行时
+        pass
+
+
+_bridge_streamlit_secrets()
+
 st.title("制造质量数据分析与检验计划辅助工具")
 
-st.caption("打开页面即可使用内置示例数据完整演示；也可以切换为上传自己的文件。")
+overview_tab, quality_tab = st.tabs(["🏭 制造运营中心", "🔍 质量分析"])
 
-data_source = st.radio(
-    "数据来源",
-    ["内置示例数据", "上传自己的文件"],
-    horizontal=True,
-)
+with overview_tab:
+    show_manufacturing_overview()
 
-if data_source == "内置示例数据":
-    sample_dir = Path(__file__).resolve().parent / "sample_data"
-    try:
-        sample_files = list_sample_files(sample_dir)
-        selected_sample_name = st.selectbox(
-            "选择演示数据",
-            [path.name for path in sample_files],
-            help="默认样例覆盖零件、工序、供应商、严重等级、日期趋势和报告导出。",
-        )
-        selected_sample_path = next(
-            path for path in sample_files if path.name == selected_sample_name
-        )
-        uploaded_file = load_sample_upload(selected_sample_path)
-        st.info(f"当前使用演示数据：{selected_sample_name}")
-    except (FileNotFoundError, OSError) as exc:
-        uploaded_file = None
-        st.error(f"示例数据加载失败：{exc}")
-else:
-    uploaded_file = st.file_uploader(
-        "上传质量异常记录文件",
-        type=["csv", "xlsx", "xls"],
-    )
-
-if uploaded_file is None:
-    if data_source == "上传自己的文件":
-        st.info("请上传 csv、xlsx 或 xls 文件。")
-else:
-    try:
-        df = load_quality_file(uploaded_file)
-    except Exception as exc:
-        st.error(f"文件读取失败：{exc}")
-    else:
-        st.success("文件读取成功。")
-
-        row_count, column_count = df.shape
-        st.write(f"数据行数：{row_count}")
-        st.write(f"数据列数：{column_count}")
-
-        missing_columns = validate_required_columns(df)
-        if missing_columns:
-            st.warning("缺少必要字段：" + "、".join(missing_columns))
-        else:
-            st.success("必要字段检查通过。")
-
-            defect_summary = summarize_by_defect_type(df)
-            total_defect_count = defect_summary["缺陷数量"].sum()
-            defect_type_count = len(defect_summary)
-
-            st.subheader("缺陷类型统计")
-            st.write(f"总缺陷数量：{total_defect_count}")
-            st.write(f"缺陷类型数量：{defect_type_count}")
-            st.dataframe(_style_df(defect_summary, ["占比"]), width="stretch")
-
-            try:
-                show_bidirectional_pareto(df)
-            except ValueError as exc:
-                st.warning(str(exc))
-            except Exception as exc:
-                st.error(f"帕雷托图生成失败：{exc}")
-
-            st.subheader("多维度问题定位")
-            part_tab, process_tab, supplier_tab, severity_tab, root_cause_tab = st.tabs(
-                ["零件", "工序", "供应商", "严重等级", "根因分析"]
-            )
-            with part_tab:
-                show_dimension_analysis(df, "零件名称", "零件")
-            with process_tab:
-                show_dimension_analysis(df, "工序", "工序")
-            with supplier_tab:
-                show_dimension_analysis(df, "供应商", "供应商")
-            with severity_tab:
-                show_dimension_analysis(df, "严重等级", "严重等级")
-            with root_cause_tab:
-                show_root_cause_analysis()
-
-            st.subheader("质量分析摘要")
-            try:
-                quality_summary = generate_quality_summary(df)
-                for item in quality_summary:
-                    st.markdown(f"- {item}")
-            except Exception as exc:
-                st.error(f"质量分析摘要生成失败：{exc}")
-
-            dataset_signature = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
-            show_deepseek_quality_analysis(df, dataset_signature)
-
-        show_date_trend_and_trace(df)
-
-        st.subheader("QC 统计图表")
-        qc_col1, qc_col2 = st.columns(2)
-
-        with qc_col1:
-            st.markdown("#### 缺陷数量直方图")
-            try:
-                hist_fig = create_histogram(df)
-                st.plotly_chart(hist_fig, width="stretch", key="qc_histogram", config={"displayModeBar": False})
-            except Exception as exc:
-                st.warning(f"直方图生成失败：{exc}")
-
-        with qc_col2:
-            st.markdown("#### 每日缺陷控制图")
-            try:
-                date_summary_for_ctrl = summarize_by_date(df)
-                if date_summary_for_ctrl.empty:
-                    st.info("暂无可用于生成控制图的数据。")
-                else:
-                    ctrl_fig = create_control_chart(date_summary_for_ctrl)
-                    st.plotly_chart(ctrl_fig, width="stretch", key="qc_control", config={"displayModeBar": False})
-            except Exception as exc:
-                st.warning(f"控制图生成失败：{exc}")
-
-        st.subheader("导出分析报告")
-        col1, col2 = st.columns(2)
-        with col1:
-            try:
-                report_bytes = build_excel_report(df)
-                st.download_button(
-                    label="下载 Excel 分析报告",
-                    data=report_bytes,
-                    file_name="quality_analysis_report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            except Exception as exc:
-                st.error(f"Excel 报告生成失败：{exc}")
-        with col2:
-            try:
-                word_bytes = build_word_report(df)
-                st.download_button(
-                    label="下载 Word 8D 分析报告",
-                    data=word_bytes,
-                    file_name="8D_quality_report.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-            except Exception as exc:
-                st.error(f"Word 8D 报告生成失败：{exc}")
+with quality_tab:
+    show_quality_analysis_page()

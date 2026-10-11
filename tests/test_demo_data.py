@@ -2,7 +2,7 @@ from io import BytesIO
 
 import pytest
 
-from src.demo_data import DEFAULT_SAMPLE_NAME, list_sample_files, load_sample_upload
+from modules.demo_data import DEFAULT_SAMPLE_NAME, list_sample_files, load_sample_upload
 
 
 def test_list_sample_files_prioritizes_default(tmp_path):

@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-import src.llm_quality_analysis as llm_module
-from src.llm_quality_analysis import (
+import modules.llm_quality_analysis as llm_module
+from modules.llm_quality_analysis import (
     DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEFAULT_DEEPSEEK_BASE_URL,
     DeepSeekAnalysisError,

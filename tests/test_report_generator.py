@@ -2,7 +2,7 @@ from io import BytesIO
 
 import pandas as pd
 
-from src.report_generator import build_excel_report
+from modules.report_generator import build_excel_report
 
 
 EXPECTED_SHEETS = [
