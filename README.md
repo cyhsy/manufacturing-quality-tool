@@ -107,6 +107,9 @@ run_app.bat
 DeepSeek AI 分析仍按原逻辑工作：仅点击「生成 AI 质量分析」时调用，API Key 取自
 `DEEPSEEK_API_KEY` 环境变量；未配置 Key 时其余统计、摘要与报表功能不受影响。
 
+部署到 Streamlit Community Cloud 的完整步骤（含 GitHub 推送、Secrets 配置、
+子域注意事项与云端限制）见 [DEPLOY.md](DEPLOY.md)。
+
 ## 数据说明（data/）
 
 | 文件 | 字段 | 规模 |

@@ -931,6 +931,29 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def _bridge_streamlit_secrets():
+    """把 Streamlit Cloud 的 Secrets 桥接到 os.environ。
+
+    本地运行时 ``DEEPSEEK_API_KEY`` 走环境变量；Streamlit Community Cloud 上
+    密钥存放在 Secrets（``st.secrets``），**不会**进入 ``os.environ``，
+    而 agents/ 与 modules/ 中的既有读取路径用的是 ``os.environ``。
+    这里做一次桥接，使云端与本地行为一致；未配置 Secrets 时静默跳过
+    （LLM 功能自动回退到规则模式）。
+    """
+    import os
+
+    try:
+        secrets = st.secrets
+        for key in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+            if key in secrets and not os.environ.get(key):
+                os.environ[key] = str(secrets[key]).strip()
+    except Exception:  # 无 secrets.toml / 非 Streamlit 运行时
+        pass
+
+
+_bridge_streamlit_secrets()
+
 st.title("制造质量数据分析与检验计划辅助工具")
 
 overview_tab, quality_tab = st.tabs(["🏭 制造运营中心", "🔍 质量分析"])
