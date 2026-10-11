@@ -11,8 +11,10 @@
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from agent_tools import df_to_records
 from agents import equipment_agent, order_agent, quality_agent, supervisor_agent
@@ -21,6 +23,31 @@ from modules.quality_analysis import analyze_quality_overview
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TODAY = date(2026, 10, 11)
+
+# 审查验收输入：口述订单 + 风险问答（无订单编号）
+ACCEPTANCE_INPUT = "工厂收到10000件电机壳体订单，15天交付，帮我分析风险"
+
+
+@pytest.fixture(autouse=True)
+def _no_llm_key_by_default(monkeypatch):
+    """默认清空 DEEPSEEK_API_KEY：避免规则类测试意外发起真实 LLM 调用。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+
+def _fake_llm_factory(payload_text):
+    """构造返回固定内容的假 LLM 客户端工厂（用于测试 LLM 规划路径）。"""
+
+    def factory(timeout=20):
+        def create(**_kwargs):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=payload_text))]
+            )
+
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+    return factory
 
 
 # --------------------------------------------------------------------------
@@ -318,3 +345,273 @@ def test_all_agent_outputs_are_json_serializable():
     for name, payload in payloads.items():
         text = json.dumps(payload, ensure_ascii=False)
         assert text, f"{name} 输出无法序列化"
+
+
+# --------------------------------------------------------------------------
+# S2 审查修复：实体抽取（口述订单）
+# --------------------------------------------------------------------------
+
+
+def test_entity_extraction_from_natural_language():
+    entities = supervisor_agent.extract_entities(
+        "工厂收到10000件电机壳体订单，15天交付，帮我分析风险"
+    )
+    assert entities["product"] == "电机壳体"
+    assert entities["quantity"] == 10000
+    assert entities["delivery_days"] == 15
+    assert entities["order_id"] is None
+
+    weekly = supervisor_agent.extract_entities("2000件涡轮支架，2周内交付")
+    assert weekly["product"] == "涡轮支架"
+    assert weekly["quantity"] == 2000
+    assert weekly["delivery_days"] == 14
+
+    dated = supervisor_agent.extract_entities("订单O002 于 2026-11-10 交付")
+    assert dated["order_id"] == "O002"
+    assert dated["deadline"] == "2026-11-10"
+
+
+def test_order_agent_analyzes_order_described_in_text():
+    """口述订单（无订单编号）同样要回答「这一单有没有风险」。"""
+    analysis = order_agent.analyze_order_request(
+        product="电机壳体", quantity=10000, delivery_days=15, today=TODAY
+    )
+
+    assert analysis["risk"] == "medium"
+    assert analysis["order_source"] == "user_description"
+    assert analysis["order_id"] is None
+    assert analysis["product"] == "电机壳体"
+    assert analysis["quantity"] == 10000
+    assert analysis["available_days"] == 15
+    assert analysis["required_days"] == 13
+    assert analysis["delivery_days"] == 15
+    assert "交期较紧" in analysis["reason"]
+    assert [item["order_id"] for item in analysis["matched_orders"]] == ["O001"]
+
+
+def test_order_agent_text_order_with_short_horizon_is_high():
+    analysis = order_agent.analyze_order_request(
+        product="电机壳体", quantity=10000, delivery_days=7, today=TODAY
+    )
+
+    assert analysis["risk"] == "high"
+    assert analysis["available_days"] == 7
+    assert "产能不足" in analysis["reason"]
+
+
+def test_order_agent_text_order_without_product_or_quantity():
+    analysis = order_agent.analyze_order_request(product=None, quantity=None)
+
+    assert analysis["risk"] == "unknown"
+    assert "缺少产品名称或数量" in analysis["reason"]
+
+
+# --------------------------------------------------------------------------
+# S2 审查修复：风险类问题覆盖五维能力
+# --------------------------------------------------------------------------
+
+
+def test_risk_query_expands_to_all_five_capabilities():
+    plan = supervisor_agent.build_plan(ACCEPTANCE_INPUT)
+
+    assert plan["intent_code"] == "comprehensive_risk"
+    assert plan["risk_focus"] is True
+    assert plan["capabilities"] == [
+        "order",
+        "inventory",
+        "production",
+        "equipment",
+        "quality",
+    ]
+    assert plan["entities"]["product"] == "电机壳体"
+    assert plan["entities"]["quantity"] == 10000
+    assert plan["entities"]["delivery_days"] == 15
+
+    actions = {step["capability"]: step["action"] for step in plan["steps"]}
+    assert actions["order"] == "analyze_order_request"
+    assert actions["equipment"] == "analyze_equipment_status"
+    assert actions["quality"] == "analyze_quality"
+    assert {step["agent"] for step in plan["steps"]} == {
+        "order_agent",
+        "equipment_agent",
+        "quality_agent",
+    }
+
+
+def test_risk_query_invokes_quality_and_equipment_agents():
+    outcome = supervisor_agent.handle(ACCEPTANCE_INPUT)
+
+    assert set(outcome["results"]) == {
+        "order_agent",
+        "equipment_agent",
+        "quality_agent",
+    }
+    for agent_name in ("order_agent", "equipment_agent", "quality_agent"):
+        assert outcome["results"][agent_name]["status"] == "ok", agent_name
+
+
+def test_risk_report_contains_quality_and_equipment_sections():
+    outcome = supervisor_agent.handle(ACCEPTANCE_INPUT)
+    report = outcome["risk_report"]
+
+    titles = [section["title"] for section in report["sections"]]
+    for expected in [
+        "订单交付风险",
+        "物料库存风险",
+        "产能风险",
+        "设备风险",
+        "质量风险",
+    ]:
+        assert expected in titles, f"风险报告缺少分段：{expected}"
+
+    assert report["overall_risk"] in {"low", "medium", "high"}
+    for section in report["sections"]:
+        assert section["risk"] in {"low", "medium", "high", "unknown"}
+        assert section["reason"]
+
+    json.dumps(outcome, ensure_ascii=False)
+
+
+def test_risk_report_order_section_answers_the_described_order():
+    outcome = supervisor_agent.handle(ACCEPTANCE_INPUT)
+
+    section = next(
+        item for item in outcome["risk_report"]["sections"] if item["capability"] == "order"
+    )
+
+    # 交期天数由用户给出（相对今天），因此结果稳定可复现：需 13 天 ≤ 15 天但 > 0.8×15 → medium
+    assert section["risk"] == "medium"
+    assert section["order_source"] == "user_description"
+    assert section["order_id"] is None
+
+
+def test_taskbook_example_keeps_three_capability_scope():
+    """任务书 S2-A-03 原示例不含「风险」字样，仍保持订单+库存+生产三件套。"""
+    plan = supervisor_agent.build_plan("分析订单O001能否按时完成")
+
+    assert plan["intent_code"] == "order_delivery"
+    assert plan["capabilities"] == ["order", "inventory", "production"]
+    assert plan["risk_focus"] is False
+
+
+def test_risk_report_available_for_plain_delivery_query():
+    outcome = supervisor_agent.handle("分析订单O009能否按时完成")
+
+    section = next(
+        item for item in outcome["risk_report"]["sections"] if item["capability"] == "order"
+    )
+    assert section["risk"] == "high"
+    assert outcome["risk_report"]["overall_risk"] == "high"
+
+
+# --------------------------------------------------------------------------
+# S2 审查修复：LLM 规划（默认优先，可注入客户端验证）
+# --------------------------------------------------------------------------
+
+
+def test_llm_planner_is_used_by_default_when_key_present(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    payload = json.dumps(
+        {
+            "capabilities": ["order", "inventory", "production", "equipment"],
+            "order_ids": ["O002"],
+            "intent": "订单交付与设备风险",
+        },
+        ensure_ascii=False,
+    )
+
+    plan = supervisor_agent.build_plan(
+        "O002 这单会不会拖期",
+        llm_client_factory=_fake_llm_factory(payload),
+    )
+
+    assert plan["planner"] == "rule+llm"
+    assert plan["llm"]["requested"] == ["order", "inventory", "production", "equipment"]
+    assert plan["llm"]["intent"] == "订单交付与设备风险"
+    assert "O002" in plan["entities"]["order_ids"]
+    assert set(plan["capabilities"]) >= {"order", "inventory", "production", "equipment"}
+
+
+def test_llm_planner_drops_unregistered_capabilities(monkeypatch):
+    """LLM 只能从注册表挑能力，越权能力必须被丢弃。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    payload = json.dumps(
+        {"capabilities": ["quality", "delete_database", "equipment"]},
+        ensure_ascii=False,
+    )
+
+    plan = supervisor_agent.build_plan(
+        "看看质量缺陷怎么样",
+        use_llm=True,
+        llm_client_factory=_fake_llm_factory(payload),
+    )
+
+    assert plan["planner"] == "rule+llm"
+    assert "delete_database" not in plan["capabilities"]
+    assert set(plan["capabilities"]) == {"quality", "equipment"}
+    assert all(step["agent"] in supervisor_agent.AGENT_DISPATCH for step in plan["steps"])
+
+
+def test_llm_planner_cannot_remove_rule_capabilities(monkeypatch):
+    """LLM 只增补不削减：风险类问题的五维能力不能被 LLM 砍掉。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    payload = json.dumps({"capabilities": ["order"]}, ensure_ascii=False)
+
+    plan = supervisor_agent.build_plan(
+        "帮我分析风险",
+        use_llm=True,
+        llm_client_factory=_fake_llm_factory(payload),
+    )
+
+    assert plan["planner"] == "rule+llm"
+    assert plan["capabilities"] == [
+        "order",
+        "inventory",
+        "production",
+        "equipment",
+        "quality",
+    ]
+
+
+def test_llm_invalid_response_falls_back_to_rules(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    plan = supervisor_agent.build_plan(
+        "分析订单O001能否按时完成",
+        use_llm=True,
+        llm_client_factory=_fake_llm_factory("这不是 JSON"),
+    )
+
+    assert plan["planner"] == "rule"
+    assert plan["capabilities"] == ["order", "inventory", "production"]
+    assert any("回退规则规划" in note for note in plan["notes"])
+
+
+def test_no_llm_switch_forces_rules_even_with_key(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+
+    plan = supervisor_agent.build_plan(
+        "分析订单O001能否按时完成",
+        use_llm=False,
+        llm_client_factory=_fake_llm_factory(json.dumps({"capabilities": ["quality"]})),
+    )
+
+    assert plan["planner"] == "rule"
+    assert plan["capabilities"] == ["order", "inventory", "production"]
+    assert any("--no-llm" in note for note in plan["notes"])
+
+
+def test_llm_planner_without_key_never_calls_client():
+    called = []
+
+    def spy_factory(timeout=20):
+        called.append(timeout)
+        raise AssertionError("未配置 Key 时不应创建 LLM 客户端")
+
+    plan = supervisor_agent.build_plan(
+        "分析订单O001能否按时完成",
+        llm_client_factory=spy_factory,
+    )
+
+    assert plan["planner"] == "rule"
+    assert called == []

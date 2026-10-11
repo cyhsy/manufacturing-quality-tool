@@ -188,32 +188,73 @@ data/*.csv
 因此「库存」「生产」两个能力由 `order_agent` 执行（订单可交付分析本身就要用库存与产能）。
 后续新增 `production_agent` 只需修改 `CAPABILITIES` 中的 `agent` 字段。
 
-示例——`分析订单O001能否按时完成`：
+### 意图规则与实体抽取
+
+Supervisor 不是「关键词直连工具」，而是先判定意图、再决定能力集合（`INTENT_RULES`），
+并同时抽取实体（订单编号 / 产品 / 数量 / 交期天数或日期）：
+
+| 意图 | 触发 | 能力集合 |
+| --- | --- | --- |
+| `comprehensive_risk` | 风险、隐患、有没有问题、出问题 | **全部 5 维**（订单+库存+生产+设备+质量） |
+| `order_delivery` | 能否、按时、交付、交期、完成、拖期 | 订单+库存+生产 |
+| `overview` | 什么情况、整体情况、概况、总览 | 全部 5 维 |
+| 细分意图 | 仅命中单一维度关键词（设备/质量/库存/生产/订单） | 该维度 |
+| `mixed_query` | 同时命中多个维度 | 命中维度 |
+| 兜底 | 仅给出订单号或「产品+数量」 | 订单+库存+生产 |
+
+要点：
+
+- **风险类问题走五维综合风险**：验收要求风险问答输出「质量风险」「设备风险」，
+  只有真正调用 `quality_agent` / `equipment_agent` 才可能产出这两段，
+  因此风险意图强制覆盖全部 5 个能力（任务书 S2-A-03 的原示例不含「风险」字样，
+  仍严格保持订单+库存+生产三件套）。
+- **口述订单也能算**：`extract_entities()` 支持
+  `10000件` / `15天` / `2周` / `2026-11-10` / `O001` 等写法，
+  没有订单编号时按用户给出的产品、数量、交期单独测算，并与在手订单做交叉引用。
+
+### 执行计划示例
+
+示例 1——任务书原示例（三件套）：
 
 ```bat
-python -m agents.supervisor_agent --plan-only "分析订单O001能否按时完成"
+python -m agents.supervisor_agent --plan-only --no-llm "分析订单O001能否按时完成"
 ```
 
 ```text
-用户输入：分析订单O001能否按时完成
 意图：订单交付能力分析（order_delivery）
-规划方式：rule
 执行计划：
   1. [订单] order_agent -> analyze_order_delivery
   2. [库存] order_agent -> get_inventory_summary
   3. [生产] order_agent -> get_factory_capacity
 ```
 
-即 Supervisor 判定需要「订单 + 库存 + 生产」三件套（`CAPABILITY_DEPENDENCIES`）：
-交付能力同时取决于订单基础信息、物料齐套性与瓶颈产能。
+示例 2——口述订单 + 风险问答（五维）：
+
+```bat
+python -m agents.supervisor_agent --plan-only --no-llm "工厂收到10000件电机壳体订单，15天交付，帮我分析风险"
+```
+
+```text
+意图：工厂综合风险分析（comprehensive_risk）
+识别实体：product=电机壳体、quantity=10000、delivery_days=15
+执行计划：
+  1. [订单] order_agent -> analyze_order_request
+  2. [库存] order_agent -> get_inventory_summary
+  3. [生产] order_agent -> get_factory_capacity
+  4. [设备] equipment_agent -> analyze_equipment_status
+  5. [质量] quality_agent -> analyze_quality
+```
 
 ### 运行方式
 
 ```bat
-python -m agents.supervisor_agent "分析订单O001能否按时完成"    # 计划 + 调度结果
-python -m agents.supervisor_agent --plan-only "设备有没有故障"  # 只看执行计划
-python -m agents.supervisor_agent --llm "分析订单O001能否按时完成"  # 启用 LLM 辅助规划
-python -m agents.order_agent O009        # 单订单可交付分析
+python -m agents.supervisor_agent "分析订单O001能否按时完成"              # 计划 + 调度结果
+python -m agents.supervisor_agent --plan-only "设备有没有故障"            # 只看执行计划
+python -m agents.supervisor_agent --no-llm "帮我分析风险"                # 强制纯规则规划
+python -m agents.supervisor_agent --llm "帮我分析风险"                   # 强制启用 LLM 规划
+python -m agents.supervisor_agent "工厂收到10000件电机壳体订单，15天交付，帮我分析风险"
+python -m agents.order_agent O009                                        # 按订单编号分析
+python -m agents.order_agent --product 电机壳体 --quantity 10000 --days 15  # 按口述订单分析
 python -m agents.equipment_agent         # 设备健康分析
 python -m agents.quality_agent           # 质量分析
 ```
@@ -229,7 +270,37 @@ python -m agents.quality_agent           # 质量分析
 {"agent": "order_agent", "status": "ok", "risk": "high", "reason": "产能不足", "suggestion": "调整排产"}
 ```
 
-`agents/order_agent.py` 的订单可交付模型（v1，简单可解释）：
+Supervisor 在 `handle()` 中额外产出**分段风险报告**，分段标题固定：
+
+| capability | 分段标题 |
+| --- | --- |
+| `order` | 订单交付风险 |
+| `inventory` | 物料库存风险 |
+| `production` | 产能风险 |
+| `equipment` | 设备风险 |
+| `quality` | 质量风险 |
+
+`overall_risk` 取各段最高风险。风险类问题下「质量风险」「设备风险」两段必然出现（实测节选）：
+
+```json
+{
+  "overall_risk": "high",
+  "sections": [
+    {"capability": "order", "title": "订单交付风险", "risk": "medium",
+     "reason": "产能可满足：瓶颈日产能 800 件，完成 10000 件约需 13 天，交期剩余 15 天；交期较紧",
+     "suggestion": "优先排产并预留缓冲时间", "order_source": "user_description", "order_id": null},
+    {"capability": "equipment", "title": "设备风险", "risk": "high",
+     "reason": "设备 15 台，正常 10 台，异常 5 台（预警 4、故障 1）；故障设备：WELD02，相关工序产能为 0",
+     "suggestion": "优先安排维保超期设备保养后再排产"},
+    {"capability": "quality", "title": "质量风险", "risk": "high",
+     "reason": "共 820 件缺陷，涉及 7 类缺陷；主要缺陷类型为 尺寸偏小（占比 19.5%）；高严重等级缺陷占比 77.1%",
+     "suggestion": "高严重等级缺陷占比偏高，建议立即组织人工复核并追溯责任工序"}
+  ]
+}
+```
+
+`agents/order_agent.py` 的订单可交付模型（v1，简单可解释），
+两个入口（ERP 在手订单 / 用户口述订单）共用同一套测算：
 
 1. 取该产品在 MES 中各道工序的产线，逐条计算「有效日产能」：
    产线停机（`stopped`）或设备故障（`fault`）时记为 0。
@@ -261,12 +332,27 @@ python -m agents.quality_agent           # 质量分析
 测试 `test_quality_agent_wraps_existing_quality_system` 断言 Agent 的
 `summary_lines` 与原函数输出完全一致、`total_defects` 与原统计一致。
 
-### LLM 辅助规划
+### LLM 规划（默认优先、规则兜底）
 
-`--llm` 时先尝试用 DeepSeek 选择能力（`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` /
-`DEEPSEEK_MODEL`，与原有质量 AI 分析同一套环境变量）；未配置 Key、依赖缺失或调用失败
-都会**自动回退纯规则规划**，并在 `notes` 中说明。LLM 只能从 `CAPABILITIES`
-注册表里挑选能力，执行计划结构始终由本模块生成，LLM 不产出可执行步骤。
+`build_plan(use_llm=None)` 为默认行为：**配置了 `DEEPSEEK_API_KEY` 就用 LLM 规划，否则用规则**；
+`--llm` / `--no-llm` 可强制开关。环境变量与原有质量 AI 分析同一套：
+`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`。
+
+安全与稳健性：
+
+- LLM 只能从 `CAPABILITIES` 注册表里挑能力，越权能力（例如 `delete_database`）直接丢弃；
+- LLM 与规则结果**取并集**，只能增补不能削减 —— 避免 LLM 漏选导致「质量风险 / 设备风险」缺失；
+- 未配置 Key、依赖缺失、调用失败、返回非 JSON、未选出合法能力，任一情况都回退纯规则规划，
+  并在 `notes` 中说明；
+- 执行计划结构始终由本模块生成，LLM 不产出可执行步骤本身。
+
+以上路径均有测试覆盖（通过注入假客户端验证，测试过程不发起真实网络请求）：
+`test_llm_planner_is_used_by_default_when_key_present`、
+`test_llm_planner_drops_unregistered_capabilities`、
+`test_llm_planner_cannot_remove_rule_capabilities`、
+`test_llm_invalid_response_falls_back_to_rules`、
+`test_no_llm_switch_forces_rules_even_with_key`、
+`test_llm_planner_without_key_never_calls_client`。
 
 ## 测试与验收
 
@@ -274,13 +360,13 @@ python -m agents.quality_agent           # 质量分析
 python -m pytest tests -q
 ```
 
-当前结果：**116 passed**。
+当前结果：**132 passed**。
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
 | `tests/test_app_smoke.py` | Streamlit 端到端冒烟：两个 Tab、驾驶舱四个模块与关键指标、原有质量分析功能与报表导出 |
 | `tests/test_operations.py` | 新增数据字段与规模、五个查询工具、分析入口、数据一致性 |
-| `tests/test_agents.py` | Agent 层：分层约束、Supervisor 计划与调度、订单交付风险、设备/质量分析与 JSON 序列化 |
+| `tests/test_agents.py` | Agent 层：分层约束、意图与实体抽取、五维风险覆盖、订单交付风险（含口述订单）、LLM 规划路径、JSON 序列化 |
 | `tests/test_defect_analysis.py` 等 | 原项目质量分析回归测试（迁移后全部通过） |
 
 ```bat

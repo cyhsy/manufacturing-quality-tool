@@ -8,6 +8,8 @@
 本模块只做取数与结构化，不做风险判定。
 """
 
+import pandas as pd
+
 from agent_tools import df_to_records, to_jsonable
 from modules.order_analysis import get_priority_breakdown, summarize_orders
 from modules.production_analysis import summarize_production
@@ -86,3 +88,37 @@ def get_order_summary():
 def get_priority_breakdown_records():
     """订单优先级分布记录（dict 列表）。"""
     return df_to_records(get_priority_breakdown())
+
+
+def list_products():
+    """全部已知产品名称（订单 ∪ MES 产线），按名称长度降序（长名优先匹配）。"""
+    products = set()
+
+    orders = query_orders()
+    if not orders.empty:
+        products.update(str(value) for value in orders["product"])
+
+    lines = query_production_capacity()
+    if not lines.empty:
+        products.update(str(value) for value in lines["product"])
+
+    return sorted(products, key=lambda name: (-len(name), name))
+
+
+def find_matching_orders(product=None, quantity=None, limit=5):
+    """按产品（可选数量）查找在手订单，返回记录列表。
+
+    用于把「用户口述的订单」与 ERP 在手订单做交叉引用。
+    """
+    orders = query_orders(product=product)
+    if orders.empty:
+        return []
+
+    if quantity is not None:
+        quantities = pd.to_numeric(orders["quantity"], errors="coerce")
+        orders = orders.loc[quantities == quantity]
+
+    if limit is not None and limit > 0:
+        orders = orders.head(limit)
+
+    return df_to_records(orders)

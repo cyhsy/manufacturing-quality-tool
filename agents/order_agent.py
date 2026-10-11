@@ -1,8 +1,15 @@
 """Order Agent：订单可交付分析（S2-A-04）。
 
+两个入口共用同一套交付判定口径：
+
+- ``analyze_order_delivery(order_id)``  —— 分析 ERP 里的在手订单（如 O001）；
+- ``analyze_order_request(product, quantity, delivery_days/deadline)``
+  —— 分析「用户在对话里口述的订单」（如「工厂收到10000件电机壳体订单，15天交付」），
+  这类输入没有订单编号，但仍必须回答「这一单有没有风险」。
+
 取数来源（全部经 agent_tools 封装，不直接读 CSV）：
 
-- ``agent_tools.order_tools.get_order()``            -> ``tools.order_tool.query_orders()``
+- ``agent_tools.order_tools.get_orders()``            -> ``tools.order_tool.query_orders()``
 - ``agent_tools.order_tools.get_production_lines()`` -> ``tools.production_tool.query_production_capacity()``
 - ``agent_tools.inventory_tools.get_shortage_list()``-> ``tools.inventory_tool.query_inventory()``
 - ``agent_tools.equipment_tools.get_equipment_records()`` -> ``tools.equipment_tool.query_equipment_status()``
@@ -115,43 +122,15 @@ def evaluate_capacity(product):
     }
 
 
-def analyze_order_delivery(order_id, today=None):
-    """订单可交付分析：返回结构化的 risk / reason / suggestion。
+def evaluate_delivery(product, quantity, deadline, today=None, extra_notes=None):
+    """交付测算核心：给定 产品 / 数量 / 交期，产出 risk / reason / suggestion 与依据。
 
-    返回 dict：
-        order_id, risk(low|medium|high|unknown), reason, suggestion,
-        product, quantity, deadline, available_days, required_days,
-        bottleneck_daily_capacity, capacity_source, capacity_lines,
-        material_summary, notes
+    该函数不关心订单来自哪里（ERP 订单行，或用户在对话里口述的订单），
+    因此 ``analyze_order_delivery()`` 与 ``analyze_order_request()`` 共用同一套判定口径。
     """
-    orders = order_tools.get_orders()
-    if orders.empty:
-        return {
-            "order_id": order_id,
-            "risk": "unknown",
-            "reason": "订单数据为空，无法分析",
-            "suggestion": "请检查 data/orders.csv 是否存在有效数据",
-            "notes": [],
-        }
-
-    matched = orders.loc[
-        orders["order_id"].astype(str).str.upper() == str(order_id).upper()
-    ]
-    if matched.empty:
-        return {
-            "order_id": order_id,
-            "risk": "unknown",
-            "reason": f"未找到订单 {order_id}",
-            "suggestion": "请核对订单编号后重试",
-            "notes": [f"可用订单编号：{'、'.join(order_tools.list_order_ids())}"],
-        }
-
-    row = matched.iloc[0]
-    quantity = int(pd.to_numeric(matched["quantity"], errors="coerce").fillna(0).iloc[0])
-    deadline = pd.to_datetime(row["deadline"], errors="coerce")
     reference = _reference_day(today)
-    available_days = None if pd.isna(deadline) else int((deadline - reference).days)
-    product = str(row["product"])
+    has_deadline = deadline is not None and not pd.isna(deadline)
+    available_days = int((deadline - reference).days) if has_deadline else None
 
     capacity = evaluate_capacity(product)
     bottleneck = capacity["bottleneck"]
@@ -165,7 +144,7 @@ def analyze_order_delivery(order_id, today=None):
     material_summary = inventory_tools.get_inventory_summary()
 
     reason_parts = []
-    notes = []
+    notes = list(extra_notes or [])
 
     # ---------- 主判定：产能可行性与工序可用性 ----------
     if capacity["blocked_lines"]:
@@ -183,7 +162,7 @@ def analyze_order_delivery(order_id, today=None):
         suggestion = "确认产线与设备可用状态后重新排产"
     elif available_days is None:
         risk = "medium"
-        reason_parts.append("订单缺少有效交付日期，无法判定交期风险")
+        reason_parts.append("缺少有效交付日期，无法判定交期风险")
         suggestion = "补齐交付日期后重新评估"
     elif required_days > available_days:
         risk = "high"
@@ -213,7 +192,7 @@ def analyze_order_delivery(order_id, today=None):
             )
             suggestion = "排产前确认设备可用状态，必要时先安排维保"
 
-    if risk == "low" and not pd.isna(deadline):
+    if risk == "low" and has_deadline:
         suggestion = f"按现有排产执行，锁定 {deadline.date().isoformat()} 交付节点"
 
     # ---------- 物料维度：近交期订单受当前物料预警影响，风险上调一级 ----------
@@ -237,14 +216,12 @@ def analyze_order_delivery(order_id, today=None):
     notes.append("本分析按单订单瓶颈产能测算，未计入其它在制订单的产能占用")
 
     return {
-        "order_id": str(row["order_id"]),
         "risk": risk,
         "reason": "；".join(reason_parts),
         "suggestion": suggestion,
-        "priority": str(row["priority"]),
         "product": product,
         "quantity": quantity,
-        "deadline": None if pd.isna(deadline) else deadline.date().isoformat(),
+        "deadline": deadline.date().isoformat() if has_deadline else None,
         "available_days": available_days,
         "required_days": required_days,
         "bottleneck_daily_capacity": bottleneck,
@@ -253,6 +230,112 @@ def analyze_order_delivery(order_id, today=None):
         "material_summary": material_summary,
         "notes": notes,
     }
+
+
+def analyze_order_delivery(order_id, today=None):
+    """分析 ERP 在手订单的可交付性（入口 1）。
+
+    返回 dict：在 ``evaluate_delivery()`` 结果基础上增加
+    ``order_id`` / ``priority`` / ``order_source="erp_order"``。
+    """
+    orders = order_tools.get_orders()
+    if orders.empty:
+        return {
+            "order_id": order_id,
+            "risk": "unknown",
+            "reason": "订单数据为空，无法分析",
+            "suggestion": "请检查 data/orders.csv 是否存在有效数据",
+            "notes": [],
+        }
+
+    matched = orders.loc[
+        orders["order_id"].astype(str).str.upper() == str(order_id).upper()
+    ]
+    if matched.empty:
+        return {
+            "order_id": order_id,
+            "risk": "unknown",
+            "reason": f"未找到订单 {order_id}",
+            "suggestion": "请核对订单编号后重试",
+            "notes": [f"可用订单编号：{'、'.join(order_tools.list_order_ids())}"],
+        }
+
+    row = matched.iloc[0]
+    quantity = int(pd.to_numeric(matched["quantity"], errors="coerce").fillna(0).iloc[0])
+    deadline = pd.to_datetime(row["deadline"], errors="coerce")
+
+    analysis = evaluate_delivery(
+        product=str(row["product"]),
+        quantity=quantity,
+        deadline=deadline,
+        today=today,
+    )
+    analysis.update(
+        {
+            "order_id": str(row["order_id"]),
+            "priority": str(row["priority"]),
+            "order_source": "erp_order",
+        }
+    )
+    return analysis
+
+
+def analyze_order_request(product, quantity, delivery_days=None, deadline=None, today=None):
+    """分析「用户口述的订单」的可交付性（入口 2）。
+
+    参数：
+        product:       产品名称（与 MES / 订单中的产品名一致）。
+        quantity:      数量。
+        delivery_days: 今天起 N 天内交付（与 deadline 二选一）。
+        deadline:      具体交付日期（ISO 字符串或日期对象）。
+        today:         参考日期，缺省取系统当天（便于测试固定时间）。
+
+    返回 dict：在 ``evaluate_delivery()`` 结果基础上增加
+    ``order_source="user_description"``、``matched_orders`` 与 ``delivery_days``。
+    """
+    if not product or quantity is None:
+        return {
+            "order_id": None,
+            "risk": "unknown",
+            "reason": "订单描述缺少产品名称或数量，无法测算",
+            "suggestion": "请补充产品与数量，例如：10000 件电机壳体，15 天交付",
+            "notes": [],
+        }
+
+    quantity = int(quantity)
+    reference = _reference_day(today)
+
+    if delivery_days is not None:
+        deadline_value = reference + pd.Timedelta(days=int(delivery_days))
+    else:
+        deadline_value = pd.to_datetime(deadline, errors="coerce")
+
+    notes = ["订单来自用户描述（未提供订单编号），按用户给出的产品/数量/交期单独测算"]
+
+    matched_orders = order_tools.find_matching_orders(product=product, quantity=quantity)
+    if matched_orders:
+        matched_ids = "、".join(str(item["order_id"]) for item in matched_orders)
+        notes.append(
+            f"文本描述与在手订单 {matched_ids} 一致（同产品同数量），"
+            "已按用户给出的交期单独测算"
+        )
+
+    analysis = evaluate_delivery(
+        product=str(product),
+        quantity=quantity,
+        deadline=deadline_value,
+        today=today,
+        extra_notes=notes,
+    )
+    analysis.update(
+        {
+            "order_id": None,
+            "order_source": "user_description",
+            "delivery_days": None if delivery_days is None else int(delivery_days),
+            "matched_orders": matched_orders,
+        }
+    )
+    return analysis
 
 
 def analyze_orders_overview():
@@ -284,7 +367,8 @@ def run(capabilities=None, arguments=None):
 
     参数：
         capabilities: 本次需要的能力列表，如 ["order", "inventory", "production"]。
-        arguments:    上下文参数，支持 ``order_id`` 或 ``order_ids``。
+        arguments:    上下文参数，支持 ``order_id`` / ``order_ids``，
+                      或订单描述 ``product`` + ``quantity`` + ``delivery_days`` / ``deadline``。
     """
     capabilities = list(capabilities or ["order"])
     arguments = dict(arguments or {})
@@ -298,7 +382,19 @@ def run(capabilities=None, arguments=None):
     }
 
     if order_id:
-        analysis = analyze_order_delivery(order_id)
+        analysis = analyze_order_delivery(order_id, today=arguments.get("today"))
+    elif arguments.get("product") and arguments.get("quantity"):
+        analysis = analyze_order_request(
+            product=arguments.get("product"),
+            quantity=arguments.get("quantity"),
+            delivery_days=arguments.get("delivery_days"),
+            deadline=arguments.get("deadline"),
+            today=arguments.get("today"),
+        )
+    else:
+        analysis = None
+
+    if analysis is not None:
         result.update(
             {
                 "risk": analysis["risk"],
@@ -308,8 +404,7 @@ def run(capabilities=None, arguments=None):
             }
         )
     else:
-        overview = analyze_orders_overview()
-        result.update(overview)
+        result.update(analyze_orders_overview())
 
     if "production" in capabilities:
         result["capacity_summary"] = order_tools.get_factory_capacity()
@@ -320,16 +415,34 @@ def run(capabilities=None, arguments=None):
 
 
 def main():
-    """命令行入口：``python -m agents.order_agent O001``。"""
+    """命令行入口。
+
+    示例：
+        python -m agents.order_agent O001
+        python -m agents.order_agent --product 电机壳体 --quantity 10000 --days 15
+    """
     import argparse
     import json
 
     parser = argparse.ArgumentParser(description="Order Agent 订单可交付分析")
-    parser.add_argument("order_id", nargs="?", help="订单编号，如 O001；缺省时输出订单总览")
+    parser.add_argument("order_id", nargs="?", help="订单编号，如 O001")
+    parser.add_argument("--product", help="产品名称，如 电机壳体")
+    parser.add_argument("--quantity", type=int, help="数量")
+    parser.add_argument("--days", type=int, help="今天起 N 天内交付")
+    parser.add_argument("--deadline", help="交付日期，如 2026-11-01")
+    parser.add_argument("--today", help="参考日期（默认系统当天），如 2026-10-11")
     args = parser.parse_args()
 
     if args.order_id:
-        payload = analyze_order_delivery(args.order_id)
+        payload = analyze_order_delivery(args.order_id, today=args.today)
+    elif args.product and args.quantity:
+        payload = analyze_order_request(
+            product=args.product,
+            quantity=args.quantity,
+            delivery_days=args.days,
+            deadline=args.deadline,
+            today=args.today,
+        )
     else:
         payload = analyze_orders_overview()
 
